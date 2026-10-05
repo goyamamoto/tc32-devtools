@@ -1,4 +1,4 @@
-// Package llvmtool finds the LLVM tools the way ../../toolchain.py does:
+// Package llvmtool finds the LLVM tools the way ../../common/toolchain.py does:
 // TC32_LLVM (a directory), then /opt/homebrew/opt/llvm/bin, then PATH;
 // ld.lld also in TC32_LLD and /opt/homebrew/opt/lld/bin.
 //

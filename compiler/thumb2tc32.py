@@ -49,7 +49,7 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 from tc32isa import INV, to_tc32  # noqa: E402,F401
 
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4

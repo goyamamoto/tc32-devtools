@@ -23,7 +23,7 @@ SPDX-License-Identifier: Apache-2.0
 import os
 import sys
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "emulator"),
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common")]
 import tc32emu as te  # noqa: E402
 from tc32isa import to_tc32  # noqa: E402
 

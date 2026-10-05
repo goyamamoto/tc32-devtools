@@ -19,7 +19,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CC=$ROOT/go/bin/tc32-cc
 S=$ROOT/checks/sem
 OUT=$ROOT/build/tc32cc
-tool() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import toolchain; print(toolchain.tool(sys.argv[2]))" "$ROOT" "$1"; }
+tool() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import toolchain; print(toolchain.tool(sys.argv[2]))" "$ROOT/common" "$1"; }
 CLANG=$(tool clang)
 LLD=$(tool ld.lld)
 NM=$(tool llvm-nm)

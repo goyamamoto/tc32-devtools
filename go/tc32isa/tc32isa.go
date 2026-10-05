@@ -5,7 +5,7 @@
 // set with the top five bits of each 16-bit instruction assigned differently;
 // the other eleven bits, and so every register, immediate and branch field,
 // are the same. TOP maps the TC32 value of those five bits to the Thumb
-// value. It is the table of ../../tc32isa.py (the reference implementation),
+// value. It is the table of ../../common/tc32isa.py (the reference implementation),
 // which was checked against Telink's own tc32-elf-objdump on all 65,536
 // values and 65,536 BL pairs (checks/isa_check.py); the test in this package
 // reads that file and requires the two tables to be equal.

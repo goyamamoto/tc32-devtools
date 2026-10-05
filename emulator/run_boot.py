@@ -26,7 +26,7 @@ import sys
 import tc32emu as te
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
 import toolchain  # noqa: E402
 NM = toolchain.tool("llvm-nm")
 

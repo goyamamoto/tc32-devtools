@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import tc32asm2thumb  # noqa: E402
 import thumb2tc32  # noqa: E402
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
 import toolchain  # noqa: E402
 
 REL_SIZE = {2: 4, 3: 4, 10: 4, 30: 4, 102: 2, 103: 2, 11: 2}   # R_ARM_ABS32, REL32, THM_CALL, THM_JUMP24, JUMP11, JUMP8, THM_PC8

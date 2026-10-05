@@ -117,7 +117,7 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 from tc32isa import TOP, to_thumb  # noqa: E402,F401
 
 # Flash: 1 MB on the TLSR8278. TC32EMU_FLASH_SIZE gives a part with less

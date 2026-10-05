@@ -29,9 +29,9 @@ func TestPermutation(t *testing.T) {
 }
 
 // TestMatchesPython: the table equals the one in the reference
-// implementation, ../../tc32isa.py.
+// implementation, ../../common/tc32isa.py.
 func TestMatchesPython(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("..", "..", "tc32isa.py"))
+	src, err := os.ReadFile(filepath.Join("..", "..", "common", "tc32isa.py"))
 	if err != nil {
 		t.Skip("reference tc32isa.py not found:", err)
 	}

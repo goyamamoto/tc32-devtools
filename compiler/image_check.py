@@ -65,7 +65,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import thumb2tc32  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
 import toolchain  # noqa: E402
 
 

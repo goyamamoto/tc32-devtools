@@ -375,13 +375,18 @@ func toolVersion(path string) string {
 func (d *driver) version() {
 	rev := Version
 	if bi, ok := debug.ReadBuildInfo(); ok {
+		// go install: the module's version (a pseudo-version names the commit).
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			rev = v
+		}
+		// go build in a checkout: the commit it was built from.
 		for _, s := range bi.Settings {
 			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
 				rev = s.Value[:12]
 			}
 		}
 	}
-	fmt.Fprintf(d.w, "tc32-cc (TC32-devtools %s); the checks were made with LLVM %s\n", rev, VerifiedLLVM)
+	fmt.Fprintf(d.w, "tc32-cc (tc32-devtools %s); the checks were made with LLVM %s\n", rev, VerifiedLLVM)
 	for _, t := range []string{"clang", "ld.lld", "llvm-objcopy", "llvm-readelf"} {
 		p := llvmtool.Tool(t)
 		v := toolVersion(p)

@@ -15,7 +15,7 @@ import struct
 import subprocess
 import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path[:0] = [os.path.join(ROOT, "emulator"), ROOT]
+sys.path[:0] = [os.path.join(ROOT, "emulator"), os.path.join(ROOT, "common")]
 GO_RUN = os.path.join(ROOT, "go", "bin", "tc32emu-run")
 SEED = 0x2A
 

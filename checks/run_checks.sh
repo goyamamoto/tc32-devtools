@@ -11,7 +11,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-NM=$(python3 -c "import sys; sys.path.insert(0, '$ROOT'); import toolchain; print(toolchain.tool('llvm-nm'))")
+NM=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/common'); import toolchain; print(toolchain.tool('llvm-nm'))")
 rc=0
 for div in 0 1; do
 	OUT=$ROOT/build/sem_div$div
@@ -195,7 +195,7 @@ printf '%s\n' "$out" | tail -1
 echo "== the register cases of the Python emulator all have a Go case, and the other way round"
 python3 -B "$ROOT/checks/reg_cases_check.py" || rc=1
 echo "== the ISA table is one object for the compiler and the emulator"
-python3 -B -c "import sys; sys.path[:0] = ['$ROOT', '$ROOT/emulator']; import tc32isa, tc32emu; assert tc32emu.TOP is tc32isa.TOP; assert sorted(tc32isa.TOP) == list(range(32)); print('ok')" || rc=1
+python3 -B -c "import sys; sys.path[:0] = ['$ROOT/common', '$ROOT/emulator']; import tc32isa, tc32emu; assert tc32emu.TOP is tc32isa.TOP; assert sorted(tc32isa.TOP) == list(range(32)); print('ok')" || rc=1
 if command -v csmith >/dev/null 2>&1; then
 	echo "== ccdiff, Csmith seeds ${SEEDS:-1-20}"
 	python3 -B "$ROOT/checks/ccdiff/ccdiff.py" --compiler thumb --seeds "${SEEDS:-1-20}" --jobs "${JOBS:-4}" --levels O2,Oz,zmk --hw-divider > "$ROOT/build/ccdiff.py.txt" || rc=1

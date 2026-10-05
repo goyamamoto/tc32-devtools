@@ -50,7 +50,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-sys.path[:0] = [ROOT, os.path.join(ROOT, "emulator")]
+sys.path[:0] = [os.path.join(ROOT, "common"), os.path.join(ROOT, "emulator")]
 import tc32emu  # noqa: E402
 import toolchain  # noqa: E402
 

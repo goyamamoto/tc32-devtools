@@ -14,8 +14,7 @@ Firmware built this way runs in daily use: the ZMK ports for three TLSR8278 keyb
 
 | Path | What it holds |
 |---|---|
-| `tc32isa.py` | The TC32 ↔ Thumb opcode mapping: one table, used by the compiler tools and the emulator |
-| `toolchain.py` | Where the LLVM tools are found (`TC32_LLVM`, `TC32_LLD`) |
+| `common/` | What the compiler tools, the emulator and the checks share: `tc32isa.py`, the TC32 ↔ Thumb opcode mapping (one table), and `toolchain.py`, where the LLVM tools are found (`TC32_LLVM`, `TC32_LLD`) |
 | `compiler/` | `thumb2tc32.py`, `tc32asm2thumb.py`, the checks of a written image (`image_check.py`, `forms_check.py`, `asm_check.py`), `tc32_flow.py`, and `runtime/` (the helpers clang calls) |
 | `emulator/` | `tc32emu.py` (CPU and TLSR8278 peripherals), `usb_model.py` (USB device controller and a host), `ble_radio.py`, `ble_central.py`, `ble_air.py`, `aes128.py` (radio, a scripted central, the air between them), `run_boot.py`, `stack_use.py`, `reg_audit.py`, `trace.py` |
 | `checks/` | `run_checks.sh` and the checks it runs; `isa_check.py`, `sem/`, `ccdiff/`, `telink/`, and the Zephyr and ZMK test drivers |
@@ -23,7 +22,7 @@ Firmware built this way runs in daily use: the ZMK ports for three TLSR8278 keyb
 
 ## Requirements
 
-- clang and ld.lld from LLVM 16 or later. The evidence was made with Homebrew LLVM 23.1.2 and lld 23.1.2. `toolchain.py` looks in `TC32_LLVM` and `TC32_LLD`, then in Homebrew's paths, then on `PATH`.
+- clang and ld.lld from LLVM 16 or later. The evidence was made with Homebrew LLVM 23.1.2 and lld 23.1.2. `common/toolchain.py` looks in `TC32_LLVM` and `TC32_LLD`, then in Homebrew's paths, then on `PATH`.
 - Python 3, with no packages beyond the standard library.
 - Go 1.22 or later, for the Go port (optional).
 - Csmith, for the differential test (optional; `run_checks.sh` skips that step without it).
@@ -105,7 +104,7 @@ tc32-cc [-c|-S|-E] [-O...] [-D...] [-I...] [-x tc32-asm] <inputs> -T <script> -o
 
 **Refused options.** Options that would change the code generation are refused with status 2: another target, CPU or float ABI, `-marm`, `-fjump-tables`, `-mllvm -arm-load-store-opt=true`, `-flto`.
 
-**What it needs.** An LLVM install: clang, ld.lld, llvm-objcopy and llvm-readelf, found as `toolchain.py` finds them (`TC32_LLVM`, `TC32_LLD`, Homebrew, `PATH`). The runtime helpers and `vendor_forms.txt` are built into the binary, so neither Python nor a checkout of this repository is needed. `tc32-cc --version` shows the tools it found. A link warns when clang is not the LLVM release the checks here were made with.
+**What it needs.** An LLVM install: clang, ld.lld, llvm-objcopy and llvm-readelf, found as `common/toolchain.py` finds them (`TC32_LLVM`, `TC32_LLD`, Homebrew, `PATH`). The runtime helpers and `vendor_forms.txt` are built into the binary, so neither Python nor a checkout of this repository is needed. `tc32-cc --version` shows the tools it found. A link warns when clang is not the LLVM release the checks here were made with.
 
 **How it is held to the rest.** `checks/tc32cc/check.sh` checks four things:
 
@@ -220,7 +219,7 @@ The Python tools are the canonical implementation, and `go/` is a port for speed
 
 | Go | Python | How they are held equal |
 |---|---|---|
-| `go/tc32isa` | `tc32isa.py` | The table is a permutation and equals the Python file's |
+| `go/tc32isa` | `common/tc32isa.py` | The table is a permutation and equals the Python file's |
 | `go/cmd/thumb2tc32` | `compiler/thumb2tc32.py` | The same image, byte for byte, from every sem build |
 | `go/cmd/image-check` (incl. `--blob`, `--startup`) | `compiler/image_check.py` | Same rules. Both read the layout through llvm-objcopy and llvm-readelf, so neither trusts its own ELF reader |
 | `go/cmd/tc32asm2thumb` | `compiler/tc32asm2thumb.py` | Same output on `checks/asm/sample.S` (every form) and on a Zephyr port's assembly files |

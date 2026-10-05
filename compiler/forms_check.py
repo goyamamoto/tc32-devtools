@@ -52,7 +52,7 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
 import tc32isa as te  # noqa: E402
 import thumb2tc32  # noqa: E402
 

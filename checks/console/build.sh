@@ -5,7 +5,7 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-tool() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import toolchain; print(toolchain.tool(sys.argv[2]))" "$ROOT" "$1"; }
+tool() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import toolchain; print(toolchain.tool(sys.argv[2]))" "$ROOT/common" "$1"; }
 CLANG=$(tool clang)
 LLD=$(tool ld.lld)
 OUT=${OUT:-$ROOT/build/console}
