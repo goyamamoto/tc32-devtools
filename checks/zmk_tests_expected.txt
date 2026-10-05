@@ -1,0 +1,11 @@
+# Tests whose snapshot cannot match on a real tick clock (zmk_tests_tc32.py --expected).
+# The mock key scan reschedules its next event from its handler, so each event lands one
+# tick later than on native_sim (whose handler takes no simulated time), and the boot takes
+# about 2 ms before the mock starts. Same events and keycodes; the lines below differ.
+combo/overlapping-combos-4-different-timeouts absolute k_uptime in "timestamp=": 74/84/94 and 148/158/165 for 71/81/91 and 143/153/159
+pointing/mouse-move/move_diagonal reports are speed x elapsed time, and the release of key 0 lands before the fifth report instead of after it
+pointing/mouse-move/processors/move_diagonal_scaling as move_diagonal
+pointing/mouse-move/processors/move_diagonal_xy_invert as move_diagonal
+pointing/mouse-move/processors/move_diagonal_xy_swap as move_diagonal
+pointing/mouse-move/processors/temp_layer/3-require-prior-idle-ms absolute last_tapped_timestamp (13 for 11) and one layer change at the idle-ms boundary
+pointing/mouse-move/processors/behaviors_hold_tap the mock's exit-after fires 10 ms after the last key event, before that event's processing is done (about 1 ms per immediate log line here), so the last "released 0x05" line is missing

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+*.o
+*.elf
+*.bin
+checks/sem/host.txt
+checks/sem/sem_host
+.DS_Store
+go/bin/
+*.go.bin
+!checks/telink/out/*.o

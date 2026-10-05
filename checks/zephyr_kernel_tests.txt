@@ -1,0 +1,22 @@
+# Zephyr's kernel test suites (tests/kernel) run on the TC32 in the emulator
+# (zephyr_kernel_tests_tc32.py). One variant per line:
+#   <name> <dir under tests/kernel> [KCONFIG=value ...]
+# The name is the build directory; the Kconfig settings go on top of the
+# emulator console settings (CONFIG_LOG_BACKEND_TC32EMU, no UART console).
+#
+# CONFIG_TIMEOUT_64BIT=y: the TC32 SoC defaults it to n (32-bit timeouts are
+# cheaper on the timeout hot path); the mutex and timer suites use absolute
+# timeouts (K_TIMEOUT_ABS_TICKS), which need it.
+# CONFIG_TEST_EXTRA_STACK_SIZE=0: the mutex suite's 14 thread stacks at the
+# default 512 + 1024 B do not fit the TLSR8278's RAM (64 KB less the 24 KB
+# boot mirror); at 512 B each they use up to 336 B (run-boot --stacks).
+sched_api         sched/schedule_api  CONFIG_TIMESLICING=y
+sched_api_nots    sched/schedule_api  CONFIG_TIMESLICING=n
+timer_api         timer/timer_api     CONFIG_TIMEOUT_64BIT=y
+workq_work        workq/work
+mutex_api         mutex/mutex_api     CONFIG_TIMEOUT_64BIT=y CONFIG_TEST_EXTRA_STACK_SIZE=0
+msgq_api          msgq/msgq_api
+semaphore         semaphore/semaphore
+common            common
+sleep             sleep
+threads_apis      threads/thread_apis

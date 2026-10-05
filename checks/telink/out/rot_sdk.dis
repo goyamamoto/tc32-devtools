@@ -1,0 +1,57 @@
+
+rot_sdk.o:     file format elf32-littletc32
+
+
+Disassembly of section .text:
+
+00000000 <sha_sigma0>:
+   0:	a30d      	tmovs	r3, #13
+   2:	ec02      	tadds	r2, r0, #0
+   4:	01da      	trotrs	r2, r3
+   6:	a302      	tmovs	r3, #2
+   8:	ec01      	tadds	r1, r0, #0
+   a:	01d9      	trotrs	r1, r3
+   c:	ec0b      	tadds	r3, r1, #0
+   e:	0053      	txors	r3, r2
+  10:	a216      	tmovs	r2, #22
+  12:	01d0      	trotrs	r0, r2
+  14:	0058      	txors	r0, r3
+  16:	0770      	tjex	lr
+
+00000018 <md5_step>:
+  18:	e810      	tadds	r0, r2, r0
+  1a:	a220      	tmovs	r2, #32
+  1c:	ead3      	tsubs	r3, r2, r3
+  1e:	01d8      	trotrs	r0, r3
+  20:	e840      	tadds	r0, r0, r1
+  22:	0770      	tjex	lr
+
+00000024 <rotv>:
+  24:	a31f      	tmovs	r3, #31
+  26:	0019      	tands	r1, r3
+  28:	a320      	tmovs	r3, #32
+  2a:	ea5b      	tsubs	r3, r3, r1
+  2c:	ec02      	tadds	r2, r0, #0
+  2e:	009a      	tshftls	r2, r3
+  30:	00c8      	tshftrs	r0, r1
+  32:	ec01      	tadds	r1, r0, #0
+  34:	ec10      	tadds	r0, r2, #0
+  36:	0308      	tors	r0, r1
+  38:	0770      	tjex	lr
+  3a:	46c0      	tstorerb	r0, [r0, #27]
+
+0000003c <checksum>:
+  3c:	6530      	tpush	{r4, r5, lr}
+  3e:	ec03      	tadds	r3, r0, #0
+  40:	a000      	tmovs	r0, #0
+  42:	a900      	tcmp	r1, #0
+  44:	cd07      	tjle	56 <checksum+0x1a>
+  46:	a200      	tmovs	r2, #0
+  48:	a51b      	tmovs	r5, #27
+  4a:	01e8      	trotrs	r0, r5
+  4c:	1c9c      	tloadrb	r4, [r3, r2]
+  4e:	0060      	txors	r0, r4
+  50:	b201      	tadds	r2, #1
+  52:	028a      	tcmp	r2, r1
+  54:	c1f9      	tjne	4a <checksum+0xe>
+  56:	6d30      	tpop	{r4, r5, pc}
