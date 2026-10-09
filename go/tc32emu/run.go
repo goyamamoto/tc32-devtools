@@ -46,13 +46,20 @@ func (m *Machine) Run(maxCycles int64, idleRanges []Range, checkEvery int) error
 				}
 			}
 			if idle {
-				// Idle loop: jump to the next compare or watchdog deadline.
+				// Idle loop: jump to the next system timer compare, or to the
+				// next match of a running Timer0/1 whose interrupt is
+				// unmasked, whichever comes first (the match sets the timer's
+				// status, an interrupt level, and the interrupt follows as the
+				// match would have interrupted the loop).
 				var skip int64
 				if m.Regs[0x748]&stimerIRQ != 0 {
 					skip = m.CyclesToStimer(m.StimerCmp)
 				}
 				if m.IdleSkipHook != nil {
 					skip = m.IdleSkipHook(skip)
+				}
+				if match, ok := m.CyclesToTimerMatch(); skip > 0 && ok && match < skip {
+					skip = match
 				}
 				if left := maxCycles - m.Cycles; left < skip {
 					skip = left // the caller's time limit stands

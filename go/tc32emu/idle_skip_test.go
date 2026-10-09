@@ -103,4 +103,64 @@ func TestIdleSkip(t *testing.T) {
 	if !ok || m.IdleSkipped*10 < at*9 || m.IdleSkipped > at {
 		t.Errorf("FAIL the cycles skipped there are counted as the idle loop's: IdleSkipped %d of %d", m.IdleSkipped, at)
 	}
+
+	// Timer1 (mode 0, the system clock) with a 500 us capture, its interrupt
+	// unmasked through 0x640 bit 1; the compare 10 ms away.
+	cap := int64(CPUHz / 2000)
+	timer1 := func(m *Machine, irqMask uint32) {
+		regWrite(m, 0x643, 1, 1)
+		regWrite(m, 0x640, 1, irqMask)
+		regWrite(m, 0x642, 1, 1<<(IRQSTimer-16))
+		regWrite(m, 0x628, 4, uint32(cap))
+		regWrite(m, 0x634, 4, 0)
+		regWrite(m, 0x620, 1, 0x08) // Timer1 enabled, mode 0
+	}
+	m = machine([]uint16{0x3001, 0xE7FD})
+	timer1(m, 1<<1)
+	start := m.Cycles
+	compareIn(m, 0.010)
+	at, ok = runToIRQ(m, CPUHz)
+	if !ok || at-start < cap || at-start >= cap+100 || m.R[0] >= 1000 {
+		t.Errorf("FAIL Timer1 running, its interrupt unmasked: taken at cycle %d (ok %v) after %d loop iterations, want the match %d cycles on, not the compare", at-start, ok, m.R[0], cap)
+	}
+
+	// The same, with a handler that clears the status and goes back to the
+	// loop: the interrupts keep the capture's spacing.
+	m = machine([]uint16{0x3001, 0xE7FD})
+	timer1(m, 1<<1)
+	var taken []int64
+	m.Hooks = map[uint32]func(*Machine) error{0x10: func(mm *Machine) error {
+		taken = append(taken, mm.Cycles)
+		if err := mm.RegWrite(0x623, 1, 0x02); err != nil { // the status cleared
+			return err
+		}
+		if err := mm.setCPSR(ModeSVC); err != nil { // back to the loop, I clear
+			return err
+		}
+		mm.R[15] = 0x100
+		return nil
+	}}
+	compareIn(m, 0.020)
+	if err := m.Run(m.Cycles+10*cap+cap/2, idle, 32); err != nil {
+		t.Fatal(err)
+	}
+	spaced := len(taken) == 10
+	for i := 1; i < len(taken); i++ {
+		if g := taken[i] - taken[i-1]; g < cap-100 || g > cap+100 {
+			spaced = false
+		}
+	}
+	if !spaced {
+		t.Errorf("FAIL Timer1's interrupts through the idle loop: %d in 10.5 periods at cycles %v, want 10 spaced by the capture %d", len(taken), taken, cap)
+	}
+
+	// The same timer with its interrupt masked: the loop skips to the compare.
+	m = machine([]uint16{0x3001, 0xE7FD})
+	timer1(m, 0)
+	start = m.Cycles
+	compareIn(m, 0.010)
+	at, ok = runToIRQ(m, CPUHz)
+	if !ok || at-start < CPUHz*9/1000 || m.R[0] >= 1000 || m.Regs[0x623]&0x02 == 0 {
+		t.Errorf("FAIL Timer1 running, its interrupt masked: taken at cycle %d (ok %v) after %d loop iterations, status 0x%02x; want the compare 10 ms on with the timer's status set", at-start, ok, m.R[0], m.Regs[0x623])
+	}
 }

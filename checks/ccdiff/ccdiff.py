@@ -16,12 +16,18 @@ Two compilers (--compiler):
   re-encoded as TC32 by ../../compiler/thumb2tc32.py (TC32_LLVM, TC32_LLD or
   --cc); its "zmk" level uses the flags of the ZMK firmware build this was
   made for (ZMK_FLAGS);
+- direct: llvm-tc32 (--cc) on the direct path, the thumb compiler's flags
+  with -mcpu=tc32 (and -noarm on the C compiles, as the thumb build
+  returns), linked by its ld.lld and written by ../../compiler/elf2bin.py;
+  each program is also built the thumb way with the same clang, and the two
+  images must be byte-identical (outcome IMAGE otherwise) before the direct
+  image runs;
 - telink: Telink's own toolchain (tc32-elf-gcc 4.5.1, binutils 2.20, its
   libgcc; x86-64 Linux binaries, TELINK_TC32 or --telink <dir>, run in
   Docker), at its own levels (TELINK_LEVELS). Its code has run on shipped
   devices, so it checks tc32emu: a Telink build that runs wrong here points
   at the emulator.
-The thumb builds use the code generation flags a firmware must use
+The thumb and direct builds use the code generation flags a firmware must use
 (FIRMWARE_FLAGS). --hw-divider builds the helpers for the TLSR8278 divider
 (tc32emu models it). --keep-elf <dir> keeps each build's ELF, or for telink
 the program's object (forms_check.py evidence --elf).
@@ -32,7 +38,7 @@ or unmodelled instruction, a bad access), SLOW (over the instruction limit;
 not a failure). A program that does not finish on the host within the time
 limit is skipped.
 
-Usage: ccdiff.py [--seeds 1-200] [--jobs 8] [--compiler thumb|telink] [--cc <bin dir>]
+Usage: ccdiff.py [--seeds 1-200] [--jobs 8] [--compiler thumb|direct|telink] [--cc <bin dir>]
                  [--telink <Telink toolchain dir>] [--limit N] [--out <dir for failing programs>]
                  [--levels O0,O2,Os,Oz(,zmk for thumb)] [--keep-elf <dir>] [--hw-divider]
                  [--engine python|go]   (go: the Go emulator, go/bin/tc32emu-run; same outcomes expected)
@@ -142,18 +148,28 @@ def divider_flags(hw_divider):
     return ["-DTC32_TLSR8278_DIVIDER=1"] if hw_divider else []
 
 
-def thumb_runtime(cc, work, hw_divider):
+DIRECT_C = ["-Xclang", "-target-feature", "-Xclang", "-noarm"]
+
+
+def direct_flags(flags):
+    """The thumb compiler's flags for the direct path: -mcpu=tc32."""
+    return ["-mcpu=tc32" if f == "-mcpu=arm7tdmi" else f for f in flags]
+
+
+def thumb_runtime(cc, work, hw_divider, direct=False):
     """Start code, shim, memory functions and this repository's helpers for
-    the thumb compiler, built once per run into work; returns the objects
-    (the start object first)."""
+    the thumb compiler (direct: on the direct path), built once per run into
+    work; returns the objects (the start object first)."""
     objs = []
+    base = direct_flags(THUMB_FLAGS) if direct else THUMB_FLAGS
     for src, flags in [(os.path.join(SEM, "start_thumb.S"), []),
                        (os.path.join(HERE, "shim.c"), ["-O2"]),
                        (os.path.join(SEM, "mem.c"), ["-O1"]),
                        (os.path.join(RUNTIME, "compiler_builtins.c"), ["-Oz"] + FIRMWARE_FLAGS + divider_flags(hw_divider)),
                        (os.path.join(RUNTIME, "aeabi_thumb.S"), [])]:
-        obj = os.path.join(work, os.path.basename(src) + ".o")
-        r = run([os.path.join(cc, "clang")] + THUMB_FLAGS + flags + ["-c", src, "-o", obj])
+        obj = os.path.join(work, os.path.basename(src) + (".direct.o" if direct else ".o"))
+        extra = DIRECT_C if direct and src.endswith(".c") else []
+        r = run([os.path.join(cc, "clang")] + base + extra + flags + ["-c", src, "-o", obj])
         if r.returncode != 0:
             raise SystemExit(f"thumb runtime: {src}: {r.stderr[-300:]}")
         objs.append(obj)
@@ -217,7 +233,49 @@ def telink_result(work, level, limit, engine="python"):
     return emulate(base + ".bin", syms, limit, engine)
 
 
-def tc32_checksum(src, work, level, cc, inc, limit, compiler, runtime, engine="python"):
+def direct_checksum(src, work, level, cc, inc, limit, runtime, engine="python"):
+    """The direct path: the program built with -mcpu=tc32 and written by
+    elf2bin.py, and the thumb build of it with the same clang; the images
+    must be equal, then the direct one runs."""
+    rt_direct, rt_thumb = runtime
+    got = tc32_checksum(src, work, level, cc, inc, limit, "thumb", rt_thumb, engine, run_image=False)
+    if got is not None:
+        return got
+    thumb_img = os.path.join(work, f"{level}.bin")
+    os.rename(thumb_img, thumb_img + ".thumb")
+    obj, elf, img = (os.path.join(work, f"{level}.direct.{x}") for x in ("o", "elf", "bin"))
+    flags = ["-w"] + FIRMWARE_FLAGS + ["-I" + os.path.join(HERE, "include"), "-I" + inc, "-c", src, "-o", obj]
+    if level == "zmk":
+        cmd = [os.path.join(cc, "clang")] + direct_flags(ZMK_FLAGS) + DIRECT_C + flags
+    else:
+        cmd = [os.path.join(cc, "clang")] + direct_flags(THUMB_FLAGS) + DIRECT_C + flags \
+            + [f for f in LEVELS[level] if f != "-mcpu=tc32"]
+    try:
+        r = run(cmd)
+    except subprocess.TimeoutExpired:
+        return "COMPILE", "compiler timeout"
+    if r.returncode != 0:
+        return "COMPILE", (r.stderr.strip().splitlines() or ["?"])[-1][:200]
+    r = run([os.path.join(cc, "ld.lld"), "-T", os.path.join(SEM, "thumb.ld"), rt_direct[0], obj] + rt_direct[1:]
+            + ["-o", elf])
+    if r.returncode != 0:
+        return "LINK", (r.stderr.strip().splitlines() or ["?"])[-1][:200]
+    r = run([sys.executable, "-B", os.path.join(COMPILER, "elf2bin.py"), elf, img])
+    if r.returncode != 0:
+        return "LINK", "elf2bin: " + (r.stderr.strip().splitlines() or ["?"])[-1][:200]
+    a, b = open(thumb_img + ".thumb", "rb").read(), open(img, "rb").read()
+    if a != b:
+        at = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
+        return "IMAGE", f"the direct image differs from the thumb path's at 0x{at:x} ({len(a)} / {len(b)} B)"
+    syms = {}
+    for line in run([os.path.join(cc, "llvm-nm"), elf]).stdout.splitlines():
+        p = line.split()
+        if len(p) == 3:
+            syms[p[2]] = int(p[0], 16)
+    return emulate(img, syms, limit, engine)
+
+
+def tc32_checksum(src, work, level, cc, inc, limit, compiler, runtime, engine="python", run_image=True):
     obj, elf, img = (os.path.join(work, f"{level}.{x}") for x in ("o", "elf", "bin"))
     flags = ["-w"] + FIRMWARE_FLAGS + ["-I" + os.path.join(HERE, "include"), "-I" + inc, "-c", src, "-o", obj]
     if compiler == "thumb" and level == "zmk":
@@ -237,6 +295,8 @@ def tc32_checksum(src, work, level, cc, inc, limit, compiler, runtime, engine="p
     r = run([sys.executable, "-B", os.path.join(COMPILER, "thumb2tc32.py"), elf, img])
     if r.returncode != 0:
         return "LINK", "thumb2tc32: " + (r.stderr.strip().splitlines() or ["?"])[-1][:200]
+    if not run_image:
+        return None
     syms = {}
     for line in run([os.path.join(cc, "llvm-nm"), elf]).stdout.splitlines():
         p = line.split()
@@ -306,9 +366,11 @@ def one(args):
         for level in levels:
             if compiler == "telink":
                 got, info = telink_result(work, level, limit, engine)
+            elif compiler == "direct":
+                got, info = direct_checksum(src, work, level, cc, inc, limit, runtime, engine)
             else:
                 got, info = tc32_checksum(src, work, level, cc, inc, limit, compiler, runtime, engine)
-            kept = f"{level}.o" if compiler == "telink" else f"{level}.elf"   # Telink: the program alone
+            kept = {"telink": f"{level}.o", "direct": f"{level}.direct.elf"}.get(compiler, f"{level}.elf")  # Telink: the program alone
             if keep and os.path.exists(os.path.join(work, kept)):
                 os.makedirs(keep, exist_ok=True)
                 shutil.copy(os.path.join(work, kept), os.path.join(keep, f"p{seed}_{kept}"))
@@ -337,7 +399,7 @@ def main():
     ap.add_argument("--limit", type=int, default=100_000_000)
     ap.add_argument("--levels")
     ap.add_argument("--out")
-    ap.add_argument("--compiler", choices=("thumb", "telink"), default="thumb")
+    ap.add_argument("--compiler", choices=("thumb", "direct", "telink"), default="thumb")
     ap.add_argument("--telink", default=os.environ.get("TELINK_TC32", ""))
     ap.add_argument("--keep-elf")
     ap.add_argument("--hw-divider", action="store_true", help="helpers for the TLSR8278 hardware divider")
@@ -345,12 +407,14 @@ def main():
                     help="the emulator: tc32emu.py, or the Go port (go/bin/tc32emu-run)")
     args = ap.parse_args()
     if not args.cc:
-        args.cc = toolchain.llvm_bin() if args.compiler == "thumb" else ""
-    if args.compiler == "thumb" and not args.cc:
-        sys.exit("no toolchain: set TC32_LLVM or pass --cc")
+        args.cc = {"thumb": toolchain.llvm_bin(), "direct": os.environ.get("TC32_LLVM_DIRECT", "")}.get(
+            args.compiler, "")
+    if args.compiler != "telink" and not args.cc:
+        sys.exit("no toolchain: set TC32_LLVM (thumb) or TC32_LLVM_DIRECT (direct), or pass --cc")
     if args.compiler == "telink" and not args.telink:
         sys.exit("no Telink toolchain: set TELINK_TC32 or pass --telink")
-    levels = (args.levels or {"telink": "O0,O2,sdk", "thumb": "O0,O2,Os,Oz,zmk"}[args.compiler]).split(",")
+    levels = (args.levels or {"telink": "O0,O2,sdk", "thumb": "O0,O2,Os,Oz,zmk", "direct": "O0,O2,Os,Oz,zmk"}[
+        args.compiler]).split(",")
     inc = csmith_include()
     runtime = []
     telink = os.path.realpath(args.telink) if args.telink else ""
@@ -358,6 +422,9 @@ def main():
     rt_dir = tempfile.mkdtemp(prefix="ccdiff_rt_")
     if args.compiler == "thumb":
         runtime = thumb_runtime(args.cc, rt_dir, args.hw_divider)
+    elif args.compiler == "direct":
+        runtime = (thumb_runtime(args.cc, rt_dir, args.hw_divider, direct=True),
+                   thumb_runtime(args.cc, rt_dir, args.hw_divider))
     else:
         runtime = telink_runtime(telink, os.path.realpath(rt_dir), inc)
     jobs = [(s, levels, args.cc, inc, args.limit, args.out, args.compiler, runtime, telink, keep, args.engine)

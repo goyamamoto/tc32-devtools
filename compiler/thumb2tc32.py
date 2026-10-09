@@ -17,7 +17,9 @@ executable output section: the tool cannot tell them from code there (the
 Zephyr linker scripts and thumb.ld keep them apart). The tool refuses what
 TC32 cannot run or would read differently:
 - ARM code ($a): TC32 has no ARM state;
-- BLX (ARMv5T), and 32-bit Thumb-2 instructions other than a BL pair.
+- BLX (ARMv5T), and 32-bit Thumb-2 instructions other than a BL pair;
+- an ELF that names the core tc32 (Tag_CPU_name): built with -mcpu=tc32,
+  its code is TC32 already, and elf2bin.py writes its image.
 Thumb encodings where TC32 has its own instructions (0xb800-0xb9ff treti,
 0xbbc0-0xbbdf tmcsr/tmrcs/tmssr/tmrss) are undefined in ARMv4T, so no
 compiler emits them; tc32asm2thumb.py writes them as .inst.n, and they are
@@ -51,6 +53,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 from tc32isa import INV, to_tc32  # noqa: E402,F401
+import armattr  # noqa: E402
 
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
 SHT_SYMTAB, SHT_NOBITS = 2, 8
@@ -121,6 +124,8 @@ def mapping_symbols(data, secs):
 def convert(elf_path):
     data = open(elf_path, "rb").read()
     secs = read_elf(data)
+    if armattr.is_tc32(data):
+        raise Refused("Tag_CPU_name is tc32: the code is TC32 already (-mcpu=tc32); elf2bin.py writes its image")
     maps, objects = mapping_symbols(data, secs)
     loaded = [s for s in secs if s["flags"] & SHF_ALLOC and s["type"] != SHT_NOBITS and s["size"]]
     # The flash image: sections at flash addresses (below the SRAM), as in the

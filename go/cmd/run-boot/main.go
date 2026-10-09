@@ -5,6 +5,8 @@
 // Usage: run-boot --elf zmk.elf --bin zmk.ota.bin [--layout direct|installed]
 //
 //	[--slot-a original.bin] [--ms 300] [--hang SYMBOL] [--resets N] [--cpi 1] [--stacks]
+//	[--console [REG]] [--console-out FILE] [--console-stream] [--stop-at SYMBOL] [--stop-line TEXT]...
+//	[--fatal-continue] [--usb]
 //
 // SPDX-License-Identifier: Apache-2.0
 package main
@@ -30,7 +32,8 @@ var fatalNames = []string{"z_fatal_error", "z_irq_spurious", "arch_system_halt",
 	"__assert_post_action", "assert_post_action", "z_tc32_fatal_error"}
 
 const paint = 0xAA
-const margin = 0.25 // fraction of each stack that must stay unused
+const margin = 0.25           // fraction of each stack that must stay unused
+const stackSection = "noinit" // Zephyr's output section for thread and kernel stacks
 
 type stack struct {
 	name string
@@ -54,14 +57,6 @@ func die(err error) {
 	os.Exit(1)
 }
 
-func nmLines(elf string) []string {
-	lines, err := nmsyms.Lines(elf)
-	if err != nil {
-		die(err)
-	}
-	return lines
-}
-
 // symbols: code symbols' addresses (bit 0 cleared) and sizes.
 func symbols(elf string) (map[string]uint32, map[string]uint32) {
 	addr, size, err := nmsyms.Symbols(elf)
@@ -71,16 +66,27 @@ func symbols(elf string) (map[string]uint32, map[string]uint32) {
 	return addr, size
 }
 
-// stacks: the image's stacks, data objects whose names contain "stack".
+// stacks: the image's stacks, data objects in the noinit section whose names
+// contain "stack" (stack_use.stacks): Zephyr places the thread and kernel
+// stacks there; objects of other sections keep their contents.
 func stacks(elf string) []stack {
 	var found []stack
-	for _, line := range nmLines(elf) {
-		p := strings.Fields(line)
-		if len(p) == 4 && len(p[2]) == 1 && strings.Contains("BbDd", p[2]) && strings.Contains(p[3], "stack") {
-			a, _ := strconv.ParseUint(p[0], 16, 32)
-			s, _ := strconv.ParseUint(p[1], 16, 32)
+	lines, err := nmsyms.SysvLines(elf)
+	if err != nil {
+		die(err)
+	}
+	for _, line := range lines {
+		// name | value | class | type | size | line | section
+		p := strings.Split(line, "|")
+		for i := range p {
+			p[i] = strings.TrimSpace(p[i])
+		}
+		if len(p) == 7 && len(p[2]) == 1 && strings.Contains("BbDd", p[2]) && p[6] == stackSection &&
+			strings.Contains(p[0], "stack") && p[4] != "" {
+			a, _ := strconv.ParseUint(p[1], 16, 32)
+			s, _ := strconv.ParseUint(p[4], 16, 32)
 			if s >= 64 {
-				found = append(found, stack{p[3], uint32(a), uint32(s)})
+				found = append(found, stack{p[0], uint32(a), uint32(s)})
 			}
 		}
 	}
@@ -126,10 +132,11 @@ func main() {
 	var elfPath, binPath, slotAPath, hang string
 	layout, ms, resets, cpi, withStacks := "direct", 300.0, 0, int64(1), false
 	regAudit, reviewed, tables := false, "", ""
-	consoleReg, consoleOut := -1, ""
+	consoleReg, consoleOut, consoleStream := -1, "", false
 	stopAt := ""
 	var stopLines []string
 	fatalContinue := false
+	withUsb := false
 	emuStop := false
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -182,18 +189,22 @@ func main() {
 			}
 		case "--console-out":
 			consoleOut = next()
+		case "--console-stream":
+			consoleStream = true
 		case "--stop-at":
 			stopAt = next()
 		case "--stop-line":
 			stopLines = append(stopLines, next())
 		case "--fatal-continue":
 			fatalContinue = true
+		case "--usb":
+			withUsb = true
 		default:
 			die(fmt.Errorf("unknown argument %s", args[i]))
 		}
 	}
 	if elfPath == "" || binPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: run-boot --elf zmk.elf --bin zmk.ota.bin [--layout direct|installed] [--slot-a image] [--ms 300] [--hang SYMBOL] [--resets N] [--cpi 1] [--stacks]")
+		fmt.Fprintln(os.Stderr, "usage: run-boot --elf zmk.elf --bin zmk.ota.bin [--layout direct|installed] [--slot-a image] [--ms 300] [--hang SYMBOL] [--resets N] [--cpi 1] [--stacks] [--usb]")
 		os.Exit(2)
 	}
 	addr, size := symbols(elfPath)
@@ -233,7 +244,19 @@ func main() {
 	}
 	m.SetSymbols(addr)
 	m.Event = eventHook
+	if withUsb {
+		// The USB device controller model with its host idle (run_boot.py --usb).
+		tc32emu.NewUsbModel(m, true)
+	}
 	var console []byte
+	streamed := 0 // with --console-stream: how much of the console is on stdout
+	streamConsole := func(end int) {
+		// console[streamed:end] to stdout, after the events printed so far
+		if end > streamed {
+			os.Stdout.Write(console[streamed:end])
+			streamed = end
+		}
+	}
 	type lineStop struct {
 		ms   float64
 		text string
@@ -245,6 +268,9 @@ func main() {
 		m.RegWriteHook = func(o, size int, val uint32) (bool, error) {
 			if o == consoleReg && size == 1 {
 				console = append(console, byte(val))
+				if byte(val) == '\n' && consoleStream {
+					streamConsole(len(console))
+				}
 				if byte(val) == '\n' && len(stopLines) > 0 {
 					start := bytes.LastIndexByte(console[:len(console)-1], '\n') + 1
 					line := string(console[start : len(console)-1])
@@ -427,6 +453,11 @@ func main() {
 		break
 	}
 
+	if consoleReg >= 0 && consoleStream && len(console) > streamed {
+		// A last line the image did not end: out as it is, ended here.
+		streamConsole(len(console))
+		fmt.Println()
+	}
 	r := m.Regs
 	fmt.Println("\n== summary")
 	fmt.Printf("simulated %.1f ms, boot slot 0x%05x, pc %s\n", m.Ms(), m.BootSlot, m.Symbolize(m.R[15]))
@@ -507,6 +538,8 @@ func main() {
 				die(err)
 			}
 			fmt.Printf("console: %d bytes to %s\n", len(console), consoleOut)
+		} else if consoleStream {
+			fmt.Printf("console: %d bytes, streamed above\n", len(console))
 		} else {
 			fmt.Printf("console: %d bytes\n", len(console))
 			fmt.Print(text)

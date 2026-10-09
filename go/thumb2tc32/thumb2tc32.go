@@ -17,7 +17,9 @@
 // only where the flags are dead), and udf (clang's trap) as b . (a branch to
 // itself). A halfword 0x0000 in code is left as it is (fill from .org or
 // .space). Addresses of Thumb code that the link writes as data (function
-// pointers) keep bit 0 set, as Telink's toolchain writes them too.
+// pointers) keep bit 0 set, as Telink's toolchain writes them too. An ELF
+// that names the core tc32 (Tag_CPU_name: built with -mcpu=tc32) is refused:
+// its code is TC32 already, and elf2bin writes its image.
 //
 // SPDX-License-Identifier: Apache-2.0
 package thumb2tc32
@@ -29,6 +31,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/goyamamoto/tc32-devtools/go/armattr"
 	"github.com/goyamamoto/tc32-devtools/go/tc32isa"
 )
 
@@ -96,6 +99,9 @@ func Convert(data []byte) ([]byte, Counts, error) {
 	}
 	if f.Class != elf.ELFCLASS32 || f.Data != elf.ELFDATA2LSB {
 		return nil, counts, refuse("not a little-endian ELF32 file")
+	}
+	if armattr.IsTC32(data) {
+		return nil, counts, refuse("Tag_CPU_name is tc32: the code is TC32 already (-mcpu=tc32); elf2bin.py writes its image")
 	}
 
 	// Mapping symbols and data objects per section index.

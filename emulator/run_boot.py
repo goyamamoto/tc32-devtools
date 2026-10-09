@@ -4,6 +4,7 @@
 Usage:
   run_boot.py --elf zmk.elf --bin zmk.ota.bin [--layout direct|installed]
               [--slot-a original.bin] [--ms 300] [--hang SYMBOL] [--resets N]
+              [--usb]
 
 Layouts:
   direct     the image alone in slot A (0x00000)
@@ -15,6 +16,9 @@ Layouts:
 SYMBOL spin forever (a hang for the watchdog to catch). Watchdog and software
 resets restart the machine with the flash kept, up to --resets times; the boot
 ROM model then starts the slot whose byte 8 is 0x4b (0x00000 first).
+
+--usb attaches the USB device controller model with an idle host, for images
+whose USB driver must find the controller's registers as on the chip.
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -82,11 +86,18 @@ def main():
     ap.add_argument("--console", type=lambda s: int(s, 0), nargs="?", const=0xFFF0, default=None,
                     help="capture the bytes the image writes to this register offset (default 0xfff0) as its console")
     ap.add_argument("--console-out", help="write the captured console text to this file (else print it after the summary)")
+    ap.add_argument("--console-stream", action="store_true",
+                    help="with --console: print each console line on stdout when the image completes it, among the "
+                         "run's events, instead of the whole text after the summary (for a test runner reading the "
+                         "output as it comes)")
     ap.add_argument("--stop-at", help="end the run when this symbol is reached (e.g. _exit), before --ms is up")
     ap.add_argument("--fatal-continue", action="store_true",
                     help="log the fatal-error symbols (asserts, faults) but let the image handle them instead of stopping")
     ap.add_argument("--stop-line", action="append", default=[],
                     help="with --console: end the run when a console line contains this text (may repeat)")
+    ap.add_argument("--usb", action="store_true",
+                    help="attach the USB device controller model (usb_model.UsbModel, interrupt lines on) with its "
+                         "host idle: no bus reset and no requests, the controller's registers as on the chip")
     a = ap.parse_args()
 
     addr, size = symbols(a.elf)
@@ -101,9 +112,22 @@ def main():
             fl.mem[:len(orig)] = orig
             fl.mem[8:12] = b"\0\0\0\0"
     m = te.Machine(fl, symbols=addr, cpi=a.cpi)
+    if a.usb:
+        import usb_model
+        usb_model.UsbModel(m, irq_lines=True)
     if a.reg_audit:
         m.reg_log = set()
     console = bytearray()
+    streamed = [0]   # with --console-stream: how much of the console is on stdout
+
+    def stream_console(end):
+        """Write console[streamed:end] to stdout after the events printed so far."""
+        if end > streamed[0]:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(bytes(console[streamed[0]:end]))
+            sys.stdout.buffer.flush()
+            streamed[0] = end
+
     if a.console is not None:
         # The image's console: one byte per write to the register (a log
         # backend the emulator reads; the register is plain storage otherwise).
@@ -112,6 +136,8 @@ def main():
         def reg_write(o, size, val, _w=base_write):
             if o == a.console and size == 1:
                 console.append(val & 0xFF)
+                if val & 0xFF == 10 and a.console_stream:
+                    stream_console(len(console))
                 if val & 0xFF == 10 and a.stop_line:
                     line = console[console.rfind(b"\n", 0, len(console) - 1) + 1:-1].decode("utf-8", "replace")
                     hit = next((t for t in a.stop_line if t in line), None)
@@ -210,6 +236,10 @@ def main():
             emu_stop = True
             break
 
+    if a.console is not None and a.console_stream and len(console) > streamed[0]:
+        # A last line the image did not end: out as it is, ended here.
+        stream_console(len(console))
+        print()
     r = m.regs_mem
     print("\n== summary")
     print(f"simulated {m.ms():.1f} ms, boot slot 0x{m.boot_slot:05x}, pc {m.symbolize(m.r[15])}")
@@ -235,6 +265,8 @@ def main():
             with open(a.console_out, "w") as f:
                 f.write(text)
             print(f"console: {len(console)} bytes to {a.console_out}")
+        elif a.console_stream:
+            print(f"console: {len(console)} bytes, streamed above")
         else:
             print(f"console: {len(console)} bytes")
             sys.stdout.write(text)

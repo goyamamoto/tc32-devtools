@@ -69,8 +69,12 @@ procedure's LL_START_ENC_RSP and LL_TERMINATE_IND, and what else is queued
 waits (Core Vol 6 Part B 5.1.3.1). And an LL_CONNECTION_UPDATE_IND's instant
 is as far ahead of the event it is first sent in as connection_update() was
 given it ahead of the event it was called in, so a queue that holds it back
-does not use the instant up. The default sends the queue in its order with
-the instant as given.
+does not use the instant up; until it is sent the central keeps its old
+parameters, whatever instant it was given. An update first sent in a later
+packet of the event just before its instant, after that event has timed the
+next one, still moves the instant's event to its transmit window. The default
+sends the queue in its order with the instant as given and moves at that
+instant.
 
 TC32EMU_CENTRAL_SKIP_EVERY=N (N > 0): from connection event 20 on, the
 central sends nothing at every Nth event (k % N == 0), so the peripheral's
@@ -83,6 +87,8 @@ import random
 import struct
 
 import aes128
+import ble_sc
+import p256
 from ble_radio import LL_NAMES, ATT_NAMES
 
 SKIP_EVERY = int(os.environ.get("TC32EMU_CENTRAL_SKIP_EVERY", "0"))
@@ -101,7 +107,7 @@ class Central:
                  event_hooks=(), send_version=True, send_features=True, refuse_update=False,
                  on_param_request=None, join=False, aa=0x71764129, active_scan=False, own_addr="public",
                  irk=DEFAULT_IRK, dist_id=False, ack_terminate=True, establish=False, mic_ends=False,
-                 ll_rules=False):
+                 ll_rules=False, param_update_lead=0):
         if own_addr not in ("public", "rpa", "rpa-wrong-irk"):
             raise ValueError("own_addr: " + own_addr)
         self.m, self.radio = m, radio
@@ -110,6 +116,7 @@ class Central:
         self.ll_rules = ll_rules
         self.enc_busy = False            # ll_rules: the central's LL_ENC_REQ is under way
         self.update_lead = 0             # ll_rules: the events the update's instant was given ahead
+        self.update_sent = False         # ll_rules: the update's PDU has gone out, its instant set
         self.heard = False               # a reply of the peripheral in this connection
         if join:
             radio.centrals.append(self)
@@ -158,9 +165,12 @@ class Central:
         self.adva_random = 1
         self.pair = pair
         self.apply_update = apply_update
+        self.param_update_lead = param_update_lead
         # The peripheral's L2CAP Connection Parameter Update Request: answered
         # accepted (result 0) and, with apply_update, followed by an
-        # LL_CONNECTION_UPDATE_IND at event + 12; with refuse_update answered
+        # LL_CONNECTION_UPDATE_IND whose instant is param_update_lead events
+        # after the event it is queued in (0: 12); with ll_rules the lead counts
+        # from the event the PDU first goes out in. With refuse_update answered
         # rejected (result 1) and never applied. on_param_request(req, action),
         # when set, is called after the answer is queued: req the request's
         # values (t_ms, event, interval_min, interval_max, latency, timeout,
@@ -178,6 +188,19 @@ class Central:
         self.enc = dict(sk=None, iv=None, tx=False, rx=False, txc=0, rxc=0, ltk=None, skdm=None, ivm=None,
                         mic_fail=0)
         self.smp = {}
+        # Secure Connections (start_pairing with sc): the central's IO capability (0 DisplayOnly, 3
+        # NoInputNoOutput), whether it asks for MITM protection, its private key (None: drawn from rng) and
+        # the passkey it shows (None: drawn from rng); displayed_passkey is the one it showed in a pairing.
+        self.io_cap = 0x03
+        self.mitm = False
+        self.sc_priv = None
+        self.passkey = None
+        self.displayed_passkey = None
+        # A fault the central commits on purpose, for the responder's negative tests: "confirm" (a wrong
+        # confirm value), "dhkey" (a wrong DHKey check), "offcurve" (a public key off the curve), "stall"
+        # (nothing after its public key), "keysize7" (a 7-octet key asked for; no fault, the keys are masked),
+        # "keysize6" (a key size below the least allowed).
+        self.fault = None
 
     # ------------------------------------------------------------ addresses and advertising
     def new_address(self):
@@ -290,6 +313,13 @@ class Central:
             self.rec("tx", f"ev {k:4d} nothing heard from the peripheral in 6 events: the connection was not"
                      " established")
             return
+        u = self.update
+        if self.ll_rules and u and not u.get("applied") and self.update_sent and k == u["instant"]:
+            # The update went out after the event before its instant had timed this one with the old
+            # parameters: this event moves to the update's transmit window.
+            self.move(u, k, self.base_t + (k - self.base_k) * self.interval_ms)
+            self.radio.at(self.base_t + self.jitter_ms(), lambda: self.conn_event(k), owner="central")
+            return
         self.event = k
         self.stats["events"] += 1
         u = self.chm_update
@@ -334,17 +364,20 @@ class Central:
                 self.stats["missed"] += 1
         nxt = self.base_t + (k + 1 - self.base_k) * self.interval_ms
         u = self.update
-        if u and not u.get("applied") and k + 1 == u["instant"]:
-            # Core Vol 6 Part B 5.1.1: the transmit window starts WinOffset after
-            # the anchor the old parameters would give the instant.
-            clk = self.clock()
-            self.base_t, self.base_k = nxt + 1.25 * clk * u["win_offset"] + self.anchor_in_window_ms, k + 1
-            self.interval_ms = u["interval"] * 1.25 * clk
-            self.p.update(interval=u["interval"], latency=u["latency"], timeout=u["timeout"])
-            u["applied"] = round(self.base_t, 3)
-            self.records["conn_update_applied"] = dict(u)
+        if u and not u.get("applied") and (self.update_sent or not self.ll_rules) and k + 1 == u["instant"]:
+            self.move(u, k + 1, nxt)
             nxt = self.base_t
         self.radio.at(nxt + self.jitter_ms(), lambda: self.conn_event(k + 1), owner="central")
+
+    def move(self, u, k, anchor):
+        """The connection update u from event k, its instant, on (Core Vol 6 Part B 5.1.1: the transmit
+        window starts WinOffset after anchor, the one the old parameters give the instant)."""
+        clk = self.clock()
+        self.base_t, self.base_k = anchor + 1.25 * clk * u["win_offset"] + self.anchor_in_window_ms, k
+        self.interval_ms = u["interval"] * 1.25 * clk
+        self.p.update(interval=u["interval"], latency=u["latency"], timeout=u["timeout"])
+        u["applied"] = round(self.base_t, 3)
+        self.records["conn_update_applied"] = dict(u)
 
     def next_pdu(self):
         """The packet to send: the one in flight again, or the next queued one
@@ -393,6 +426,7 @@ class Central:
             self.enc_busy = True
         elif llid == 3 and p[:1] == b"\x00" and self.update and not self.update.get("applied"):
             self.update["instant"] = (self.event + self.update_lead) & 0xFFFF
+            self.update_sent = True
             p = p[:10] + struct.pack("<H", self.update["instant"])
         return llid, p, tag
 
@@ -486,6 +520,7 @@ class Central:
         self.update = dict(win_size=win_size, win_offset=win_offset, interval=interval, latency=latency,
                            timeout=timeout, instant=instant & 0xFFFF)
         self.update_lead = (instant - self.event) & 0xFFFF
+        self.update_sent = False
         self.queue_ll(bytes([0x00, win_size]) + struct.pack("<HHHHH", win_offset, interval, latency, timeout,
                                                             instant & 0xFFFF))
 
@@ -560,6 +595,9 @@ class Central:
         elif op == 0x06:                            # the peripheral's LL_START_ENC_RSP (encrypted)
             self.records["encryption_on_ms"] = round(self.m.ms(), 3)
             self.enc_busy = False
+            s = self.smp
+            if s.get("pka") is not None and s.get("pres") and (s["pres"][6] & 0x07) == 0:
+                self.smp_complete()                   # Secure Connections, nothing to come from the responder
         elif op in (0x0D, 0x11):
             self.records.setdefault("peripheral_reject", []).append(p.hex())
             self.enc_busy = False
@@ -590,7 +628,7 @@ class Central:
                     self.queue_l2cap(5, bytes([0x13, ident]) + struct.pack("<HH", 2, 0))
                     action = "accepted"
                     if self.apply_update and self.update is None:
-                        self.connection_update(1, 0, mx, lat, to, self.event + 12)
+                        self.connection_update(1, 0, mx, lat, to, self.event + (self.param_update_lead or 12))
                         action, req["instant"] = "applied", self.update["instant"]
                 if self.on_param_request is not None:
                     self.on_param_request(req, action)
@@ -647,17 +685,139 @@ class Central:
     def smp_send(self, d):
         self.queue_l2cap(6, d)
 
-    def start_pairing(self):
-        # IO NoInputNoOutput, no OOB, AuthReq bonding, 16-octet keys, initiator
-        # init_key_dist (nothing, or IdKey with dist_id), responder EncKey | IdKey.
-        self.smp = dict(preq=bytes([0x01, 0x03, 0x00, 0x01, 0x10, self.init_key_dist, 0x03]), t0=round(self.m.ms(), 3),
-                        keys={})
+    def start_pairing(self, sc=False):
+        # No OOB, AuthReq bonding (with sc also Secure Connections, and MITM when asked for), 16-octet keys,
+        # initiator init_key_dist (nothing, or IdKey with dist_id), responder EncKey | IdKey; the IO
+        # capability NoInputNoOutput unless io_cap says otherwise.
+        auth = 0x01 | (0x08 if sc else 0) | (0x04 if sc and self.mitm else 0)
+        key_size = {"keysize7": 7, "keysize6": 6}.get(self.fault, 0x10)
+        self.smp = dict(preq=bytes([0x01, self.io_cap if sc else 0x03, 0x00, auth, key_size, self.init_key_dist, 0x03]),
+                        t0=round(self.m.ms(), 3), keys={})
         self.m.flash_log_start = len(self.m.flash.log)
         self.smp_send(self.smp["preq"])
 
+    # ------------------------------------------------------------ Secure Connections (initiator)
+    def sc_method(self):
+        """Just Works, or Passkey Entry with this side showing the passkey (Core 2.3.5.1, Table 2.8 with the
+        responder KeyboardOnly or NoInputNoOutput)."""
+        s = self.smp
+        rio = s["pres"][1]
+        if not ((s["preq"][3] | s["pres"][3]) & 0x04) or rio == 0x03 or self.io_cap == 0x03:
+            return "jw"
+        return "passkey-display"
+
+    def sc_start(self):
+        s = self.smp
+        while True:
+            priv = self.sc_priv if self.sc_priv is not None else self.rng.getrandbits(256)
+            if 1 <= priv < p256.N:
+                break
+            self.sc_priv = None
+        s["priv"], s["pkb"] = priv, None
+        s["pka"] = p256.point_to_le(p256.public_key(priv))
+        s["method"] = self.sc_method()
+        s["round"] = 0
+        if s["method"] == "passkey-display":
+            s["passkey"] = self.passkey if self.passkey is not None else self.rng.randrange(1000000)
+            self.displayed_passkey = s["passkey"]
+        pk = s["pka"]
+        if self.fault == "offcurve":
+            pk = pk[:63] + bytes([pk[63] ^ 0x01])
+        self.smp_send(bytes([0x0C]) + pk)
+
+    def sc_z(self):
+        s = self.smp
+        if s["method"] == "jw":
+            return 0
+        return 0x80 | ((s["passkey"] >> s["round"]) & 1)
+
+    def sc_send_confirm(self):
+        s = self.smp
+        s["na"] = bytes(self.rng.randrange(256) for _ in range(16))
+        cai = ble_sc.f4(s["pka"][:32], s["pkb"][:32], s["na"], self.sc_z())
+        if self.fault == "confirm":
+            cai = bytes([cai[0] ^ 0x01]) + cai[1:]
+        self.smp_send(bytes([0x03]) + cai)
+
+    def sc_dhkey_check(self):
+        s = self.smp
+        dh = p256.dhkey(s["priv"], p256.point_from_le(s["pkb"]))
+        a1 = ble_sc.addr7(self.inita_type, self.inita)
+        a2 = ble_sc.addr7(self.adva_random, self.adva)
+        s["mackey"], ltk = ble_sc.f5(dh, s["na"], s["nb"], a1, a2)
+        key_size = min(s["preq"][4], s["pres"][4])
+        ltk = ltk[:key_size] + bytes(16 - key_size)
+        s["ltk"] = ltk.hex()
+        r = s["passkey"].to_bytes(16, "little") if s["method"] != "jw" else bytes(16)
+        s["r"] = r
+        ea = ble_sc.f6(s["mackey"], s["na"], s["nb"], r, ble_sc.iocap_of(s["preq"]), a1, a2)
+        if self.fault == "dhkey":
+            ea = bytes([ea[0] ^ 0x01]) + ea[1:]
+        self.smp_send(bytes([0x0D]) + ea)
+        self.enc["ltk"] = int.from_bytes(ltk, "little")
+
+    def sc_rx(self, code, d):
+        """The Secure Connections PDUs; True when handled here."""
+        s = self.smp
+        if code == 0x0C:                            # Pairing Public Key (the responder's)
+            s["pkb"] = bytes(d[1:65])
+            pk = p256.point_from_le(s["pkb"])
+            s["pkb_on_curve"] = p256.on_curve(pk)
+            if not s["pkb_on_curve"]:
+                self.smp_send(bytes([0x05, 0x0B]))
+                return True
+            if self.fault == "stall":
+                return True                      # and nothing more: the responder's timeout
+            if s["method"] == "passkey-display":
+                self.sc_send_confirm()           # round 0: the initiator's confirm comes first
+            return True
+        if code == 0x03 and s.get("pkb") is not None:   # Pairing Confirm (Cb, or a round's Cbi)
+            s["cb"] = bytes(d[1:17])
+            if self.fault == "stall":
+                return True
+            if s["method"] == "jw":
+                s["na"] = bytes(self.rng.randrange(256) for _ in range(16))
+            self.smp_send(bytes([0x04]) + s["na"])
+            return True
+        if code == 0x04 and s.get("pkb") is not None:   # Pairing Random (Nb, or Nbi)
+            s["nb"] = bytes(d[1:17])
+            ok = ble_sc.f4(s["pkb"][:32], s["pka"][:32], s["nb"], self.sc_z()) == s["cb"]
+            s.setdefault("confirms_ok", []).append(ok)
+            if not ok:
+                s["sconfirm_ok"] = False
+                self.smp_send(bytes([0x05, 0x04]))
+                self.script_step(dict(ok=False, reason=0x04))
+                return True
+            s["round"] += 1
+            if s["method"] != "jw" and s["round"] < 20:
+                self.sc_send_confirm()
+                return True
+            s["sconfirm_ok"] = True
+            self.sc_dhkey_check()
+            return True
+        if code == 0x0D:                            # DHKey Check (Eb)
+            a1 = ble_sc.addr7(self.inita_type, self.inita)
+            a2 = ble_sc.addr7(self.adva_random, self.adva)
+            eb = ble_sc.f6(s["mackey"], s["nb"], s["na"], s["r"], ble_sc.iocap_of(s["pres"]), a2, a1)
+            s["dhkey_check_ok"] = bytes(d[1:17]) == eb
+            if not s["dhkey_check_ok"]:
+                self.smp_send(bytes([0x05, 0x0B]))
+                self.script_step(dict(ok=False, reason=0x0B))
+                return True
+            self.enc["skdm"] = bytes(self.rng.randrange(256) for _ in range(8))
+            self.enc["ivm"] = bytes(self.rng.randrange(256) for _ in range(4))
+            self.queue_ll(bytes([0x03]) + bytes(8) + bytes(2) + self.enc["skdm"] + self.enc["ivm"])  # LL_ENC_REQ
+            return True
+        return False
+
     def smp_rx(self, d):
         code, s = d[0], self.smp
-        if code == 0x02:                            # Pairing Response
+        if code == 0x02 and (d[3] & s["preq"][3] & 0x08):   # Pairing Response, Secure Connections agreed
+            s["pres"] = bytes(d[:7])
+            self.sc_start()
+        elif s.get("pka") is not None and self.sc_rx(code, d):
+            pass
+        elif code == 0x02:                          # Pairing Response (legacy)
             s["pres"] = bytes(d[:7])
             s["mrand"] = bytes(self.rng.randrange(256) for _ in range(16))
             mc = aes128.c1(0, int.from_bytes(s["mrand"], "little"), s["preq"], s["pres"], self.inita_type, self.inita,
@@ -682,18 +842,24 @@ class Central:
         elif code in (0x06, 0x07, 0x08, 0x09):
             s["keys"][{6: "LTK", 7: "EDIV_Rand", 8: "IRK", 9: "identity_address"}[code]] = d[1:].hex()
             if code == 0x09:
-                # The responder's keys come first (Core Vol 3 Part H 3.6.1); then the central's
-                # IdKey, when it offered it and the response kept it.
-                if s["preq"][5] & s.get("pres", bytes(7))[5] & 0x02:
-                    self.smp_send(bytes([0x08]) + self.irk)
-                    self.smp_send(bytes([0x09, 0x00]) + self.identity)
-                    s["sent_keys"] = dict(IRK=self.irk.hex(), identity_address=(bytes([0]) + self.identity).hex())
-                s["done_ms"] = round(self.m.ms(), 3)
-                if self.on_bond is not None:
-                    self.on_bond()
-                self.script_step(dict(ok=True))
+                self.smp_complete()
         elif code == 0x0B:
             s["security_request"] = d.hex()
+
+    def smp_complete(self):
+        """The responder's keys are in (Core Vol 3 Part H 3.6.1), or it distributes none: the central's IdKey
+        goes out when it offered it and the response kept it, and the pairing is done."""
+        s = self.smp
+        if s.get("done_ms"):
+            return
+        if s["preq"][5] & s.get("pres", bytes(7))[5] & 0x02:
+            self.smp_send(bytes([0x08]) + self.irk)
+            self.smp_send(bytes([0x09, 0x00]) + self.identity)
+            s["sent_keys"] = dict(IRK=self.irk.hex(), identity_address=(bytes([0]) + self.identity).hex())
+        s["done_ms"] = round(self.m.ms(), 3)
+        if self.on_bond is not None:
+            self.on_bond()
+        self.script_step(dict(ok=True))
 
     def hook_event(self, k):
         if self.script is not None and not self.att_started and k >= 4:

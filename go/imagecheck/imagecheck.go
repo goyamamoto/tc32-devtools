@@ -1,5 +1,5 @@
 // Package imagecheck is image-check: it checks the TC32 image thumb2tc32 wrote against the Thumb ELF
-// it came from.
+// it came from, or the image elf2bin wrote against the TC32 ELF it came from.
 //
 // Usage: image-check <firmware.elf> <firmware.bin> [--objcopy <llvm-objcopy>] [--readelf <llvm-readelf>]
 //
@@ -12,6 +12,8 @@
 // section is classified from the ELF: code (inside an executable section,
 // after a $t mapping symbol, not inside a sized STT_OBJECT) must be
 // thumb2tc32.Encode of the ELF's halfword; everything else must be unchanged;
+// in an ELF whose build attributes name the core tc32 (llvm-readelf -A:
+// Tag_CPU_name, the direct path) code must be unchanged too;
 // padding inside a segment must be the ELF's bytes, between segments 0xff;
 // the image must be as long as objcopy's output. --blob and --startup check a
 // blob and the startup against their manifests, as image_check.py does. Exit
@@ -62,6 +64,22 @@ type mark struct {
 }
 
 type span struct{ start, end uint32 }
+
+// cpuName is Tag_CPU_name as llvm-readelf -A prints it ("" when absent).
+func cpuName(tool, elfPath string) string {
+	lines := readelf(tool, "-A", elfPath)
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "TagName: CPU_name" {
+			continue
+		}
+		for _, nxt := range lines[i+1 : min(i+3, len(lines))] {
+			if t := strings.TrimSpace(nxt); strings.HasPrefix(t, "Value:") {
+				return strings.TrimSpace(strings.SplitN(t, ":", 2)[1])
+			}
+		}
+	}
+	return ""
+}
 
 func readelf(tool, flag, elfPath string) []string {
 	out, err := exec.Command(tool, flag, "-W", elfPath).Output()
@@ -206,6 +224,7 @@ func Main(argv []string, w, ew io.Writer) (code int) {
 	secs := sections(readelfTool, elfPath)
 	segs := loads(readelfTool, elfPath)
 	syms := symbols(readelfTool, elfPath)
+	tc32 := strings.EqualFold(cpuName(readelfTool, elfPath), "tc32")
 
 	var bad []string
 	if len(img) != len(raw) {
@@ -302,11 +321,13 @@ func Main(argv []string, w, ew io.Writer) (code int) {
 			}
 			want := hw
 			if code {
-				want = thumb2tc32.Encode(hw)
-				nCode++
-				if _, k := thumb2tc32.Rewrite(hw); k == thumb2tc32.KindMovs || k == thumb2tc32.KindUdf {
-					nRewritten++
+				if !tc32 {
+					want = thumb2tc32.Encode(hw)
+					if _, k := thumb2tc32.Rewrite(hw); k == thumb2tc32.KindMovs || k == thumb2tc32.KindUdf {
+						nRewritten++
+					}
 				}
+				nCode++
 			} else {
 				nData++
 			}
@@ -607,8 +628,12 @@ func Main(argv []string, w, ew io.Writer) (code int) {
 			startup += ")"
 		}
 	}
-	fmt.Fprintf(stdout, "%s: %d B; %d loaded sections; %d code halfwords (re-encoded, %d rewritten), %d data halfwords (unchanged); %d mismatch(es); %s%s%s\n",
-		binPath, len(img), len(ld), nCode, nRewritten, nData, len(bad), dataCopy, blob, startup)
+	how := fmt.Sprintf("re-encoded, %d rewritten", nRewritten)
+	if tc32 {
+		how = "TC32 as linked"
+	}
+	fmt.Fprintf(stdout, "%s: %d B; %d loaded sections; %d code halfwords (%s), %d data halfwords (unchanged); %d mismatch(es); %s%s%s\n",
+		binPath, len(img), len(ld), nCode, how, nData, len(bad), dataCopy, blob, startup)
 	for i, b := range bad {
 		if i >= 40 {
 			break

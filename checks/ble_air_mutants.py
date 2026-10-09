@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Controls for ble_air_check.py: each of these changes to the air model, the
 radio's use of it and the central's must make that check fail. Every mutant
-is one replaced piece of text in a copy of emulator/ and checks/ in a
-temporary folder; the repository's files are not touched.
+is one replaced piece of text in a copy of emulator/, checks/ and common/
+in a temporary folder; the repository's files are not touched. The copy
+without a change must pass the check first, so that a copy which cannot run
+does not count every mutant as caught.
 
 Usage: ble_air_mutants.py
 
@@ -42,26 +44,43 @@ MUTANTS = [
      "        if self.enc_busy:\n            for i, item", "        if False:\n            for i, item"),
     ("ll_rules: the update's instant stays as given", "emulator/ble_central.py",
      'self.update["instant"] = (self.event + self.update_lead) & 0xFFFF', "pass"),
+    ("ll_rules: an update not yet sent is applied at its instant", "emulator/ble_central.py",
+     '(self.update_sent or not self.ll_rules) and k + 1 == u["instant"]', 'k + 1 == u["instant"]'),
     ("ll_rules: a rejection does not end the wait", "emulator/ble_central.py",
      'self.records.setdefault("peripheral_reject", []).append(p.hex())\n            self.enc_busy = False',
      'self.records.setdefault("peripheral_reject", []).append(p.hex())'),
+    ("ll_rules: an update sent late in the event before its instant is not applied", "emulator/ble_central.py",
+     'and self.update_sent and k == u["instant"]:', 'and self.update_sent and False:'),
+    ("param_update_lead: the update's instant is 12 events on", "emulator/ble_central.py",
+     "self.event + (self.param_update_lead or 12))", "self.event + 12)"),
     ("reclock keeps the old interval", "emulator/ble_central.py",
      "        self.interval_ms = self.p[\"interval\"] * 1.25 * self.clock()", "        pass"),
 ]
 
 
+def copy_tree(tree):
+    os.makedirs(tree)
+    for d in ("emulator", "checks", "common"):
+        shutil.copytree(os.path.join(ROOT, d), os.path.join(tree, d), ignore=shutil.ignore_patterns("__pycache__"))
+    for f in os.listdir(ROOT):
+        if f.endswith(".py"):
+            shutil.copy(os.path.join(ROOT, f), tree)
+
+
 def main():
     bad = 0
     with tempfile.TemporaryDirectory() as tmp:
+        tree = os.path.join(tmp, "unchanged")
+        copy_tree(tree)
+        r = subprocess.run([sys.executable, "-B", os.path.join(tree, "checks", "ble_air_check.py")],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or any(ln.startswith("FAIL") for ln in r.stdout.splitlines()):
+            print("FAIL the unchanged copy does not pass the check:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+            return 1
+        print("ok   the unchanged copy passes the check")
         for n, (name, path, old, new) in enumerate(MUTANTS):
             tree = os.path.join(tmp, str(n))
-            os.makedirs(tree)
-            for d in ("emulator", "checks"):
-                shutil.copytree(os.path.join(ROOT, d), os.path.join(tree, d),
-                                ignore=shutil.ignore_patterns("__pycache__"))
-            for f in os.listdir(ROOT):
-                if f.endswith(".py"):
-                    shutil.copy(os.path.join(ROOT, f), tree)
+            copy_tree(tree)
             p = os.path.join(tree, path)
             text = open(p).read()
             if text.count(old) != 1:

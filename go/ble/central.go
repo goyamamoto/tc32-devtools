@@ -83,6 +83,19 @@ type SMP struct {
 	SecurityRequest string
 	Started         bool
 	SentKeys        map[string]string // the central's IdKey, when it sent it
+	// Secure Connections (the Python smp dict's keys of the same names)
+	Priv          *big.Int
+	PKa, PKb      []byte // the public keys as the PDUs carry them, x then y
+	Method        string // "jw" or "passkey-display"
+	Round         int
+	Passkey       int
+	Na, Nb, Cb    []byte
+	MacKey, R     []byte
+	LTK           string // hex, on-air order, masked to the key size
+	PKbOnCurve    bool
+	ConfirmsOK    []bool
+	HasDHKeyCheck bool
+	DHKeyCheckOK  bool
 }
 
 // CentralSkipEvery is the Python SKIP_EVERY (TC32EMU_CENTRAL_SKIP_EVERY): N > 0
@@ -151,6 +164,7 @@ type Central struct {
 	AdvPDU           []byte
 	Pair             bool
 	ApplyUpdate      bool
+	UpdateLead       int                                   // the Python param_update_lead
 	RefuseUpdate     bool                                  // the Python refuse_update
 	OnParamRequest   func(req ParamRequest, action string) // the Python on_param_request
 	DropAt           map[int]bool                          // events whose first non-empty reply the central loses
@@ -173,7 +187,17 @@ type Central struct {
 	OnAdvFn        func(c *Central, pdu []byte, ch byte) []byte
 	StartPairingFn func(c *Central)
 	ScriptStepFn   func(c *Central, value any)
-	LLCtrlFn       func(c *Central, p []byte)
+	// Secure Connections (StartPairingSC): the central's IO capability (0 DisplayOnly, 3 NoInputNoOutput),
+	// whether it asks for MITM protection, its private key (nil: drawn from the rng) and the passkey it
+	// shows (-1: drawn from the rng); DisplayedPasskey is the one it showed in a pairing (-1: none).
+	IOCap            byte
+	MITM             bool
+	SCPriv           *big.Int
+	Passkey          int
+	DisplayedPasskey int
+	// Fault is the Python fault: "confirm", "dhkey", "offcurve", "stall", "keysize7", "keysize6" or "".
+	Fault    string
+	LLCtrlFn func(c *Central, p []byte)
 
 	// Establish is the Python establish: a connection with nothing heard by
 	// event 6 was not established, State "failed". Heard: a reply of the
@@ -184,10 +208,12 @@ type Central struct {
 	// its MIC ends the connection at once, State "mic-failed".
 	MicEnds bool
 	// LLRules is the Python ll_rules; encBusy: the central's LL_ENC_REQ is
-	// under way; updateLead: the events the update's instant was given ahead.
+	// under way; updateLead: the events the update's instant was given ahead;
+	// updateSent: the update's PDU has gone out, its instant set.
 	LLRules    bool
 	encBusy    bool
 	updateLead int
+	updateSent bool
 
 	// OnBond is the Python on_bond: called when the peripheral's keys are all
 	// in, the central's own queued but not sent.
@@ -257,6 +283,10 @@ type Options struct {
 	Establish bool
 	MicEnds   bool
 	LLRules   bool
+	// UpdateLead is the Python param_update_lead: the events from the event
+	// an applied parameter request's LL_CONNECTION_UPDATE_IND is queued in
+	// (with LLRules: first goes out in) to its instant; 0: 12.
+	UpdateLead int
 }
 
 // DefaultIRK is the central's IRK, LSO first, as Identity Information carries it.
@@ -303,12 +333,14 @@ func NewCentral(m *tc32emu.Machine, radio *Radio, o Options) *Central {
 		c.Log = func(string) {}
 	}
 	c.Establish, c.MicEnds, c.LLRules = o.Establish, o.MicEnds, o.LLRules
+	c.UpdateLead = o.UpdateLead
 	for _, e := range o.DropAt {
 		c.DropAt[e] = true
 	}
 	c.OnAdvFn = (*Central).onAdv
 	c.StartPairingFn = (*Central).startPairing
 	c.ScriptStepFn = (*Central).scriptStep
+	c.IOCap, c.Passkey, c.DisplayedPasskey = 0x03, -1, -1
 	c.LLCtrlFn = (*Central).llCtrl
 	if o.DistID {
 		c.InitKeyDist = 0x02
@@ -493,6 +525,13 @@ func (c *Central) connEvent(k int) {
 			" established", k))
 		return
 	}
+	if u := c.update; c.LLRules && u != nil && !u.IsApplied && c.updateSent && k == u.Instant {
+		// The update went out after the event before its instant had timed this
+		// one with the old parameters: this event moves to the update's transmit window.
+		c.move(u, k, c.baseT+float64(float64(k-c.baseK)*c.IntervalMs))
+		c.Radio.At(c.baseT+c.jitterMs(), func() { c.connEvent(k) }, "central")
+		return
+	}
 	c.Event = k
 	c.Stats.Events++
 	if u := c.chmUpdate; u != nil && k == u.Instant {
@@ -544,18 +583,23 @@ func (c *Central) connEvent(k int) {
 		}
 	}
 	nxt := c.baseT + float64(float64(k+1-c.baseK)*c.IntervalMs)
-	if u := c.update; u != nil && !u.IsApplied && k+1 == u.Instant {
-		// Core Vol 6 Part B 5.1.1: the transmit window starts WinOffset after the
-		// anchor the old parameters would give the instant.
-		clk := c.clock()
-		c.baseT, c.baseK = nxt+float64(float64(1.25*clk)*float64(u.WinOffset))+c.AnchorInWindowMs, k+1
-		c.IntervalMs = float64(float64(u.Interval)*1.25) * clk
-		c.P.Interval, c.P.Latency, c.P.Timeout = u.Interval, u.Latency, u.Timeout
-		u.Applied, u.IsApplied = round3(c.baseT), true
-		c.Records["conn_update_applied"] = *u
+	if u := c.update; u != nil && !u.IsApplied && (c.updateSent || !c.LLRules) && k+1 == u.Instant {
+		c.move(u, k+1, nxt)
 		nxt = c.baseT
 	}
 	c.Radio.At(nxt+c.jitterMs(), func() { c.connEvent(k + 1) }, "central")
+}
+
+// move is the Python move: the connection update u from event k, its instant,
+// on (Core Vol 6 Part B 5.1.1: the transmit window starts WinOffset after
+// anchor, the one the old parameters give the instant).
+func (c *Central) move(u *Update, k int, anchor float64) {
+	clk := c.clock()
+	c.baseT, c.baseK = anchor+float64(float64(1.25*clk)*float64(u.WinOffset))+c.AnchorInWindowMs, k
+	c.IntervalMs = float64(float64(u.Interval)*1.25) * clk
+	c.P.Interval, c.P.Latency, c.P.Timeout = u.Interval, u.Latency, u.Timeout
+	u.Applied, u.IsApplied = round3(c.baseT), true
+	c.Records["conn_update_applied"] = *u
 }
 
 // nextPDU: the packet to send: the one in flight again, or the next queued
@@ -629,6 +673,7 @@ func (c *Central) takeTagged() (byte, []byte, any) {
 		c.encBusy = true
 	} else if q.llid == 3 && len(q.payload) > 0 && q.payload[0] == 0x00 && c.update != nil && !c.update.IsApplied {
 		c.update.Instant = (c.Event + c.updateLead) & 0xFFFF
+		c.updateSent = true
 		p := append([]byte(nil), q.payload[:10]...)
 		q.payload = binary.LittleEndian.AppendUint16(p, uint16(c.update.Instant))
 	}
@@ -775,6 +820,7 @@ func (c *Central) ChannelMapUpdate(chm []byte, instant int) {
 func (c *Central) ConnectionUpdate(winSize, winOffset, interval, latency, timeout, instant int) {
 	c.update = &Update{winSize, winOffset, interval, latency, timeout, instant & 0xFFFF, 0, false}
 	c.updateLead = (instant - c.Event) & 0xFFFF
+	c.updateSent = false
 	p := []byte{0x00, byte(winSize)}
 	for _, v := range []int{winOffset, interval, latency, timeout, instant & 0xFFFF} {
 		p = binary.LittleEndian.AppendUint16(p, uint16(v))
@@ -888,6 +934,9 @@ func (c *Central) llCtrl(p []byte) {
 	case op == 0x06: // the peripheral's LL_START_ENC_RSP (encrypted)
 		c.Records["encryption_on_ms"] = round3(c.M.Ms())
 		c.encBusy = false
+		if s := &c.SMP; s.PKa != nil && len(s.Pres) >= 7 && s.Pres[6]&0x07 == 0 {
+			c.smpComplete() // Secure Connections, nothing to come from the responder
+		}
 	case op == 0x0D || op == 0x11:
 		appendRecord(c, "peripheral_reject", hex.EncodeToString(p))
 		c.encBusy = false
@@ -924,7 +973,11 @@ func (c *Central) l2cap(cid int, data []byte) {
 			} else {
 				c.QueueL2CAP(5, []byte{0x13, ident, 2, 0, 0, 0})
 				if c.ApplyUpdate && c.update == nil {
-					c.ConnectionUpdate(1, 0, mx, lat, to, c.Event+12)
+					lead := c.UpdateLead
+					if lead == 0 {
+						lead = 12
+					}
+					c.ConnectionUpdate(1, 0, mx, lat, to, c.Event+lead)
 					action, req.Instant = "applied", c.update.Instant
 				}
 			}
@@ -1002,19 +1055,195 @@ func (c *Central) smpSend(d []byte) { c.QueueL2CAP(6, d) }
 // StartPairing starts SMP legacy Just Works pairing (the Python start_pairing).
 func (c *Central) StartPairing() { c.StartPairingFn(c) }
 
-func (c *Central) startPairing() {
-	// IO NoInputNoOutput, no OOB, AuthReq bonding, 16-octet keys, initiator
-	// InitKeyDist (nothing, or IdKey with DistID), responder EncKey | IdKey.
-	c.SMP = SMP{Preq: []byte{0x01, 0x03, 0x00, 0x01, 0x10, c.InitKeyDist, 0x03}, T0: round3(c.M.Ms()), Keys: map[string]string{},
-		Started: true}
+func (c *Central) startPairing() { c.StartPairingSC(false) }
+
+// StartPairingSC is the Python start_pairing(sc): no OOB, AuthReq bonding (with sc also Secure
+// Connections, and MITM when asked for), 16-octet keys, the initiator's InitKeyDist (nothing, or IdKey with
+// DistID), the responder EncKey | IdKey; the IO capability NoInputNoOutput unless IOCap says otherwise.
+func (c *Central) StartPairingSC(sc bool) {
+	auth, io := byte(0x01), byte(0x03)
+	if sc {
+		auth |= 0x08
+		io = c.IOCap
+		if c.MITM {
+			auth |= 0x04
+		}
+	}
+	keySize := byte(0x10)
+	switch c.Fault {
+	case "keysize7":
+		keySize = 7
+	case "keysize6":
+		keySize = 6
+	}
+	c.SMP = SMP{Preq: []byte{0x01, io, 0x00, auth, keySize, c.InitKeyDist, 0x03}, T0: round3(c.M.Ms()), Keys: map[string]string{},
+		Started: true, Passkey: -1}
 	c.FlashLogStart = len(c.M.Flash.Log)
 	c.smpSend(c.SMP.Preq)
+}
+
+// ------------------------------------------------------------ Secure Connections (initiator)
+
+// scMethod: Just Works, or Passkey Entry with this side showing the passkey (Core 2.3.5.1, Table 2.8 with
+// the responder KeyboardOnly or NoInputNoOutput).
+func (c *Central) scMethod() string {
+	s := &c.SMP
+	rio := s.Pres[1]
+	if (s.Preq[3]|s.Pres[3])&0x04 == 0 || rio == 0x03 || c.IOCap == 0x03 {
+		return "jw"
+	}
+	return "passkey-display"
+}
+
+func (c *Central) scStart() {
+	s := &c.SMP
+	for {
+		priv := c.SCPriv
+		if priv == nil {
+			priv = c.rng.getrandbitsBig(256)
+		}
+		if priv.Sign() > 0 && priv.Cmp(P256Order) < 0 {
+			s.Priv = priv
+			break
+		}
+		c.SCPriv = nil
+	}
+	s.PKb = nil
+	s.PKa = PublicKey(s.Priv)
+	s.Method = c.scMethod()
+	s.Round = 0
+	if s.Method == "passkey-display" {
+		if c.Passkey >= 0 {
+			s.Passkey = c.Passkey
+		} else {
+			s.Passkey = int(c.rng.randrange(1000000))
+		}
+		c.DisplayedPasskey = s.Passkey
+	}
+	pk := append([]byte(nil), s.PKa...)
+	if c.Fault == "offcurve" {
+		pk[63] ^= 0x01
+	}
+	c.smpSend(append([]byte{0x0C}, pk...))
+}
+
+func (c *Central) scZ() byte {
+	s := &c.SMP
+	if s.Method == "jw" {
+		return 0
+	}
+	return 0x80 | byte((s.Passkey>>uint(s.Round))&1)
+}
+
+func (c *Central) scSendConfirm() {
+	s := &c.SMP
+	s.Na = c.rng.bytes(16)
+	cai := F4(s.PKa[:32], s.PKb[:32], s.Na, c.scZ())
+	if c.Fault == "confirm" {
+		cai[0] ^= 0x01
+	}
+	c.smpSend(append([]byte{0x03}, cai...))
+}
+
+func (c *Central) scDHKeyCheck() {
+	s := &c.SMP
+	dh := DHKey(s.Priv, s.PKb)
+	a1, a2 := Addr7(c.InitAType, c.InitA), Addr7(c.AdvARandom, c.AdvA)
+	var ltk []byte
+	s.MacKey, ltk = F5(dh, s.Na, s.Nb, a1, a2)
+	keySize := int(s.Preq[4])
+	if int(s.Pres[4]) < keySize {
+		keySize = int(s.Pres[4])
+	}
+	for i := keySize; i < 16; i++ {
+		ltk[i] = 0
+	}
+	s.LTK = hex.EncodeToString(ltk)
+	s.R = make([]byte, 16)
+	if s.Method != "jw" {
+		binary.LittleEndian.PutUint32(s.R, uint32(s.Passkey))
+	}
+	ea := F6(s.MacKey, s.Na, s.Nb, s.R, IOCapOf(s.Preq), a1, a2)
+	if c.Fault == "dhkey" {
+		ea[0] ^= 0x01
+	}
+	c.smpSend(append([]byte{0x0D}, ea...))
+	c.Enc.LTK = aes128.FromLE(ltk)
+}
+
+// scRx handles the Secure Connections PDUs; true when it did.
+func (c *Central) scRx(code byte, d []byte) bool {
+	s := &c.SMP
+	switch {
+	case code == 0x0C: // Pairing Public Key (the responder's)
+		s.PKb = append([]byte(nil), d[1:65]...)
+		s.PKbOnCurve = OnCurve(s.PKb)
+		if !s.PKbOnCurve {
+			c.smpSend([]byte{0x05, 0x0B})
+			return true
+		}
+		if c.Fault == "stall" {
+			return true // and nothing more: the responder's timeout
+		}
+		if s.Method == "passkey-display" {
+			c.scSendConfirm() // round 0: the initiator's confirm comes first
+		}
+		return true
+	case code == 0x03 && s.PKb != nil: // Pairing Confirm (Cb, or a round's Cbi)
+		s.Cb = append([]byte(nil), d[1:17]...)
+		if c.Fault == "stall" {
+			return true
+		}
+		if s.Method == "jw" {
+			s.Na = c.rng.bytes(16)
+		}
+		c.smpSend(append([]byte{0x04}, s.Na...))
+		return true
+	case code == 0x04 && s.PKb != nil: // Pairing Random (Nb, or Nbi)
+		s.Nb = append([]byte(nil), d[1:17]...)
+		ok := string(F4(s.PKb[:32], s.PKa[:32], s.Nb, c.scZ())) == string(s.Cb)
+		s.ConfirmsOK = append(s.ConfirmsOK, ok)
+		if !ok {
+			s.SconfirmOK = false
+			c.smpSend([]byte{0x05, 0x04})
+			c.ScriptStepFn(c, PairResult{false, 0x04})
+			return true
+		}
+		s.Round++
+		if s.Method != "jw" && s.Round < 20 {
+			c.scSendConfirm()
+			return true
+		}
+		s.SconfirmOK = true
+		c.scDHKeyCheck()
+		return true
+	case code == 0x0D: // DHKey Check (Eb)
+		a1, a2 := Addr7(c.InitAType, c.InitA), Addr7(c.AdvARandom, c.AdvA)
+		eb := F6(s.MacKey, s.Nb, s.Na, s.R, IOCapOf(s.Pres), a2, a1)
+		s.HasDHKeyCheck, s.DHKeyCheckOK = true, string(d[1:17]) == string(eb)
+		if !s.DHKeyCheckOK {
+			c.smpSend([]byte{0x05, 0x0B})
+			c.ScriptStepFn(c, PairResult{false, 0x0B})
+			return true
+		}
+		c.Enc.SKDm = c.rng.bytes(8)
+		c.Enc.IVm = c.rng.bytes(4)
+		p := append([]byte{0x03}, make([]byte, 10)...) // LL_ENC_REQ: Rand 0, EDIV 0
+		p = append(p, c.Enc.SKDm...)
+		c.QueueLL(append(p, c.Enc.IVm...))
+		return true
+	}
+	return false
 }
 
 func (c *Central) smpRx(d []byte) {
 	code, s := d[0], &c.SMP
 	switch {
-	case code == 0x02: // Pairing Response
+	case code == 0x02 && d[3]&s.Preq[3]&0x08 != 0: // Pairing Response, Secure Connections agreed
+		s.Pres = append([]byte(nil), d[:7]...)
+		c.scStart()
+	case s.PKa != nil && c.scRx(code, d):
+	case code == 0x02: // Pairing Response (legacy)
 		s.Pres = append([]byte(nil), d[:7]...)
 		s.Mrand = c.rng.bytes(16)
 		mc := aes128.C1(big.NewInt(0), aes128.FromLE(s.Mrand), s.Preq, s.Pres, c.InitAType, c.InitA, c.AdvARandom, c.AdvA)
@@ -1039,23 +1268,31 @@ func (c *Central) smpRx(d []byte) {
 	case code >= 0x06 && code <= 0x09:
 		s.Keys[map[byte]string{6: "LTK", 7: "EDIV_Rand", 8: "IRK", 9: "identity_address"}[code]] = hex.EncodeToString(d[1:])
 		if code == 0x09 {
-			// The responder's keys come first (Core Vol 3 Part H 3.6.1); then the
-			// central's IdKey, when it offered it and the response kept it.
-			if len(s.Pres) >= 6 && s.Preq[5]&s.Pres[5]&0x02 != 0 {
-				c.smpSend(append([]byte{0x08}, c.IRK...))
-				c.smpSend(append([]byte{0x09, 0x00}, c.Identity...))
-				s.SentKeys = map[string]string{"IRK": hex.EncodeToString(c.IRK),
-					"identity_address": hex.EncodeToString(append([]byte{0}, c.Identity...))}
-			}
-			s.DoneMs = round3(c.M.Ms())
-			if c.OnBond != nil {
-				c.OnBond()
-			}
-			c.ScriptStepFn(c, PairResult{true, 0})
+			c.smpComplete()
 		}
 	case code == 0x0B:
 		s.SecurityRequest = hex.EncodeToString(d)
 	}
+}
+
+// smpComplete: the responder's keys are in (Core Vol 3 Part H 3.6.1), or it distributes none: the
+// central's IdKey goes out when it offered it and the response kept it, and the pairing is done.
+func (c *Central) smpComplete() {
+	s := &c.SMP
+	if s.DoneMs != 0 {
+		return
+	}
+	if len(s.Pres) >= 6 && s.Preq[5]&s.Pres[5]&0x02 != 0 {
+		c.smpSend(append([]byte{0x08}, c.IRK...))
+		c.smpSend(append([]byte{0x09, 0x00}, c.Identity...))
+		s.SentKeys = map[string]string{"IRK": hex.EncodeToString(c.IRK),
+			"identity_address": hex.EncodeToString(append([]byte{0}, c.Identity...))}
+	}
+	s.DoneMs = round3(c.M.Ms())
+	if c.OnBond != nil {
+		c.OnBond()
+	}
+	c.ScriptStepFn(c, PairResult{true, 0})
 }
 
 func (c *Central) hookEvent(k int) {

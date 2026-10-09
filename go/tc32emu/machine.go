@@ -178,7 +178,46 @@ type Machine struct {
 	wdFed      int64
 	mspiAuto   bool
 	rng        uint32
-	DivOps     int
+	// The random number generator's source and the 32 kHz jitter (rbg.go).
+	rbgMode    int
+	rbgParam   uint32
+	rbgState   uint64
+	rbgIndex   int
+	rbgCycle   []uint32
+	k32SigmaNs int64
+	k32Rng     uint64
+	k32Count   int64
+	k32Next    float64
+	k32Stopped *uint32 // the frozen 32 kHz count (0xfff8 bit 31), or nil
+	// The public key engine (pke.go): the time per operation, the cycle the
+	// operation under way is done at (-1: idle, Done clear), the stop reason
+	// it ends with, and the operand RAM words it writes then.
+	pkeUs      int64
+	pkeDoneAt  int64
+	pkeRT      uint32
+	pkePending []pkeWrite
+	// The ADC's VBAT conversions (adc.go): the setting and its sequence, and
+	// the DMA's run (from adcT0, one conversion per adcPeriod cycles, adcDone
+	// of them written).
+	adcMode   int
+	adcParam  uint32
+	adcState  uint64
+	adcIndex  int64
+	adcOn     bool
+	adcT0     int64
+	adcPeriod int64
+	adcDone   int64
+
+	adcPinCodes map[int]uint32 // pin input (1-10) -> its code (0xffe4)
+
+	// The SPI master and the device on its bus (spi.go).
+	SpiDev       *SpiDevice
+	spiBusyUntil int64
+	spiRx        byte
+	// The AES block's input and output (aes.go).
+	aesIn  []byte
+	aesOut []byte
+	DivOps int
 	// ICacheMiss is the cycles a flash cache miss costs (TC32EMU_ICACHE_MISS;
 	// 0: no cache model), ICacheMisses their count; see the Python ICACHE_MISS.
 	// LogAnalog turns on the record of the analog port's accesses, which the
@@ -353,6 +392,13 @@ func NewMachine(flash *Flash, bootSlot int, cpi int64) (*Machine, error) {
 	} else {
 		m.SRAM = make([]byte, SRAMSize)
 	}
+	// The random number generator's source and the 32 kHz jitter: emulator
+	// settings, kept across resets.
+	m.rbgSet(RBGMode, RBGParam)
+	m.adcSet(ADCMode, ADCParam)
+	m.pkeUs = PKEUs
+	m.k32SigmaNs = K32JitterNs
+	m.k32Rng = K32JitterSeed
 	if err := m.Reset(bootSlot, false); err != nil {
 		return nil, err
 	}
@@ -402,6 +448,8 @@ func (m *Machine) Reset(bootSlot int, causeWd bool) error {
 	copy(keep[:], m.Analog[0x3A:0x3D])
 	m.Regs = make([]byte, RegSize)
 	m.Analog = [256]byte{}
+	m.adcOn = false
+	m.pkeDoneAt, m.pkeRT, m.pkePending = -1, 0, nil
 	// 0x35-0x39 are kept in deep sleep only: every reset puts them at their
 	// defaults, 0x20, 0, 0, 0 and 0xff (DS-TLSR8278 Table 2-2).
 	m.Analog[0x35], m.Analog[0x39] = 0x20, 0xFF
@@ -443,10 +491,16 @@ func (m *Machine) Reset(bootSlot int, causeWd bool) error {
 	m.tmrWrap = [2]bool{}
 	m.wdFed = 0
 	m.mspiAuto = false
+	m.spiBusyUntil, m.spiRx = 0, 0
+	if m.SpiDev != nil {
+		m.SpiDev.selected = false
+	}
 	m.BootCopy = copyLen
 	m.Asleep = nil
 	m.sleepSince = 0
 	m.k32Wake = nil
+	m.k32Count, m.k32Next = 0, k32PeriodMs
+	m.aesIn, m.aesOut = nil, nil
 	m.ResetCount++
 	for _, f := range m.ResetHooks {
 		f()
@@ -527,7 +581,15 @@ func (m *Machine) stimerRaw() uint32 {
 // StimerNow is the system timer count as read (bits 2:0 read 0).
 func (m *Machine) StimerNow() uint32 { return m.stimerRaw() &^ 7 }
 
-func (m *Machine) k32Now() uint32 { return uint32(int64(m.Ms()*32.768) & m32) }
+func (m *Machine) k32Now() uint32 {
+	if m.k32Stopped != nil {
+		return *m.k32Stopped
+	}
+	if m.k32SigmaNs == 0 {
+		return uint32(int64(m.Ms()*32.768) & m32)
+	}
+	return m.k32Jittered()
+}
 
 func (m *Machine) tick2Now() uint32 { return uint32((m.Cycles - m.tick2Base) & m32) }
 
@@ -536,6 +598,8 @@ func (m *Machine) tick2Now() uint32 { return uint32((m.Cycles - m.tick2Base) & m
 func (m *Machine) UpdateTime() error {
 	if m.Regs[0xB10]&0x04 != 0 {
 		m.dfifo2Fill()
+	} else {
+		m.adcOn = false
 	}
 	now := m.StimerNow()
 	if m.stimerOn && m.Regs[0x748]&stimerIRQ != 0 {
@@ -664,25 +728,6 @@ func (m *Machine) tmrCtrlWritten() error {
 	return nil
 }
 
-// dfifo2Fill: the ADC's DMA keeps its buffer (0xb08 address, 0xb0b high
-// byte, 0xb0a size in 16-byte units - 1) full of 32-bit samples.
-func (m *Machine) dfifo2Fill() {
-	hi := int(m.Regs[0xB0B])
-	if hi == 0 {
-		hi = 0x04
-	}
-	addr := 0x800000 | hi<<16 | int(m.Regs[0xB08]) | int(m.Regs[0xB09])<<8
-	size := (int(m.Regs[0xB0A]) + 1) * 16
-	o := addr - SRAMBase
-	if 0 <= o && o+size <= SRAMSize {
-		var sample [4]byte
-		binary.LittleEndian.PutUint32(sample[:], m.ADCCode)
-		for i := 0; i+4 <= size; i += 4 {
-			copy(m.SRAM[o+i:o+i+4], sample[:])
-		}
-	}
-}
-
 // CyclesToStimer is the number of cycles until the system timer reaches target.
 func (m *Machine) CyclesToStimer(target uint32) int64 {
 	if !m.stimerOn {
@@ -693,6 +738,35 @@ func (m *Machine) CyclesToStimer(target uint32) int64 {
 		return 0
 	}
 	return int64(delta)*m.CPUHz/STimerHz + 1
+}
+
+// CyclesToTimerMatch is the Python cycles_to_timer_match: the cycles until
+// the first match of a running Timer0/1 whose interrupt is unmasked (0x640
+// bit 0/1), and false when there is none. A timer waiting for its wrap
+// matches after the wrap.
+func (m *Machine) CyclesToTimerMatch() (int64, bool) {
+	var best int64
+	found := false
+	for n := 0; n < 2; n++ {
+		if !m.tmrOn[n] || m.Regs[0x640]&(1<<uint(n)) == 0 {
+			continue
+		}
+		cap := int64(binary.LittleEndian.Uint32(m.Regs[0x624+4*n:]))
+		if cap == 0 {
+			continue
+		}
+		left := m.tmrBase[n] + cap - m.Cycles
+		if m.tmrWrap[n] {
+			left += 1 << 32
+		}
+		if left < 0 {
+			left = 0
+		}
+		if !found || left < best {
+			best, found = left, true
+		}
+	}
+	return best, found
 }
 
 // ------------------------------------------------------------ memory
@@ -867,6 +941,30 @@ func (m *Machine) RegRead(o, size int) (uint32, error) {
 		var val [4]byte
 		binary.LittleEndian.PutUint32(val[:], m.IrqSources()&0xFFFFFF)
 		return leInt(clip(val[:], o-0x648, size)), nil
+	case o == 0x08 && size == 1 && m.SpiDev != nil:
+		v := m.spiRx
+		if m.spiRunning() && r[0x09]&0x08 != 0 {
+			m.spiOctet(-1) // a read clocks the next octet in
+		}
+		return uint32(v), nil
+	case o == 0x09 && size == 1 && m.SpiDev != nil:
+		v := r[0x09] &^ 0x40
+		if m.Cycles < m.spiBusyUntil {
+			v |= 0x40
+		}
+		return uint32(v), nil
+	case o == 0xFFD8 && size == 4:
+		if m.SpiDev == nil {
+			return 0, nil
+		}
+		return uint32(m.SpiDev.Transactions&0xFFFF)<<16 | uint32(m.SpiDev.Count&0xFFFF), nil
+	case o == 0xFFDC && size == 1:
+		if m.SpiDev == nil || len(m.SpiDev.Fifo) == 0 {
+			return 0, nil
+		}
+		v := m.SpiDev.Fifo[0]
+		m.SpiDev.Fifo = m.SpiDev.Fifo[1:]
+		return uint32(v), nil
 	case o == 0x0C && size == 1:
 		if m.Flash.Beyond >= 0 {
 			if m.Flash.BeyondMode == "stop" {
@@ -888,14 +986,31 @@ func (m *Machine) RegRead(o, size int) (uint32, error) {
 		return uint32(r[0x0D] &^ 0x10), nil // never busy
 	case o == 0xBA && size == 1:
 		return uint32(r[0xBA] &^ 0x01), nil // analog port never busy
+	case o == pkeStat || o == pkeRtCode || (pkeRAMA <= o && o < pkeRAMEnd):
+		// The public key engine: Done, STOP_LOG, and the operand RAM once an
+		// operation has ended (pke.go).
+		if v, handled := m.pkeRead(o, size); handled {
+			return v, nil
+		}
 	case o == 0x4408 && size == 1:
-		return uint32(r[0x4408] | 0x01), nil // random number ready
+		if m.rbgReady() {
+			return uint32(r[0x4408] | 0x01), nil // a number is ready
+		}
+		return uint32(r[0x4408] & 0xFE), nil
 	case o == 0x440C && size == 4:
-		m.rng = m.rng*1103515245 + 12345
-		return m.rng, nil
+		return m.rbgWord(), nil
+	case o == 0x548 && size == 4:
+		// The AES block's output, a word per read.
+		return m.aesRead(), nil
 	case o == 0x74B && size == 1:
+		if K32Frozen {
+			return 0, nil
+		}
 		return (m.k32Now() & 1) << 5, nil
 	case o == 0x750 && size == 4:
+		if K32Frozen {
+			return 0, nil
+		}
 		return m.k32Now(), nil
 	case o == 0x754 && size == 4:
 		// reg_system_32k_tick_cal: system timer ticks per 32 kHz tick, times 16
@@ -932,6 +1047,44 @@ func (m *Machine) RegWrite(o, size int, val uint32) error {
 	}
 	r := m.Regs
 	switch {
+	case (o == 0x540 && size == 1) || (o == 0x548 && size == 4):
+		// The AES block: 0x540 starts a block, 0x548 takes the input.
+		m.aesWrite(o, val)
+		return nil
+	case o == 0xFFE4 && size == 4:
+		// Emulator-only setting (adc.go): a pin input's code.
+		return m.adcPinControl(o, val)
+	case o == 0xFFD8 && size == 4:
+		// Emulator-only setting (spi.go): a device on the SPI bus, afresh.
+		return m.spiAttach(val)
+	case o == 0x08 && size == 1 && m.spiRunning():
+		if m.Cycles < m.spiBusyUntil {
+			return emuErr("SPI: 0x08 written while an octet is going out at %s", m.Symbolize(m.R[15]))
+		}
+		r[0x08] = byte(val)
+		out := int(val & 0xFF)
+		if r[0x09]&0x04 != 0 {
+			out = -1
+		}
+		m.spiOctet(out)
+		return nil
+	case o == 0x09 && size == 1 && m.SpiDev != nil:
+		r[0x09] = byte(val) &^ 0x40
+		m.spiCsUpdate()
+		return nil
+	case o == pkeCtrl || o == pkeStat || o == 0xFFEC:
+		// The public key engine's control and status, and the emulator-only
+		// time per operation (pke.go).
+		if handled, err := m.pkeWriteReg(o, size, val); handled {
+			return err
+		}
+	case o == 0xFFE8 && size == 4:
+		// Emulator-only setting (adc.go): the ADC's VBAT conversions.
+		return m.adcControl(o, val)
+	case (o == 0xFFF4 || o == 0xFFF8 || o == 0xFFFC) && size == 4:
+		// Emulator-only settings (rbg.go): the random number source, the
+		// 32 kHz jitter and its seed.
+		return m.rbgControl(o, val)
 	case o == 0x740 && size == 4:
 		m.tickBase, m.tickBaseCy = val, m.Cycles
 		m.lastTick = val &^ 7
@@ -1110,6 +1263,7 @@ func (m *Machine) RegWrite(o, size int, val uint32) error {
 				}
 				if 0x0E <= addr && addr <= 0x15 {
 					m.holdPads((addr - 0x0E) / 2) // a pull changed
+					m.spiCsUpdate()
 				}
 				if m.LogAnalog {
 					m.AnalogWrites = append(m.AnalogWrites, AnalogWrite{byte(addr), r[0xB9], m.Symbolize(m.R[15])})
@@ -1153,6 +1307,9 @@ func (m *Machine) RegWrite(o, size int, val uint32) error {
 	}
 	if (o < 0x5A0 && o+size > 0x580) || (o <= 0x5B5 && 0x5B5 < o+size) {
 		m.GpioIrqUpdate()
+	}
+	if m.SpiDev != nil && o < 0x5B8 && o+size > 0x580 {
+		m.spiCsUpdate()
 	}
 	return nil
 }

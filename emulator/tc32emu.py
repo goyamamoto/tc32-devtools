@@ -79,14 +79,80 @@ Peripherals modelled, as DS-TLSR8278 (Ver 1.0.4) describes the TLSR8278:
   remainder), from the Telink SDK's common/div_mod.S; not in the datasheet.
   Division by zero and the time it takes are not known; here quotient -1,
   at once.
-- Not documented: a random number generator at 0x804400 (enable
-  bit 0), 0x804408 (bit 0: a number is ready, always here) and 0x80440c
-  (the number; a fixed pseudo-random sequence here).
+- The random number generator (DS-TLSR8278 17; the datasheet numbers its
+  registers 0x4000-0x4087, firmware reaches them at 0x804400-0x80440c:
+  CR bit 0 enable, RTCR, SR bit 0 a number is ready, DR the
+  number). By default (TC32EMU_RBG unset, "lcg") SR bit 0 always reads 1
+  and DR gives a fixed linear congruential sequence. The other sources (RBG
+  below) are faults to test against: SR bit 0 reads 1 only while the block
+  is out of reset (0x62 bit 3 clear), clocked (0x65 bit 3) and enabled (CR
+  bit 0), and DR gives 0 otherwise.
+- The AES block (DS-TLSR8278 15.4): 0x540 bit 0 decrypt (1) or encrypt (0);
+  a write to 0x540 starts a block (bit 1 reads 1: data wanted); the key at
+  0x550-0x55f in standard AES order; four u32 written to 0x548 are the input,
+  after the fourth bit 2 reads 1 and four reads of 0x548 give the output. The
+  same model as the BLE radio model's (ble_radio.py), which keeps its own when
+  attached; the time the block takes is not modelled.
+- The 32 kHz timer's phase against the system timer: without a model the
+  count (0x750) is the exact 32768 Hz of the simulated time, so its edges
+  fall at fixed points of the 16 MHz system timer. TC32EMU_K32_JITTER_NS
+  (ns, 0 or unset: off) adds to each 32 kHz period a random amount with that
+  standard deviation (a sum of four uniforms, from TC32EMU_K32_JITTER_SEED):
+  white period jitter, whose phase walks at random. The figure is the
+  caller's assumption; nothing in it measures the chip's RC oscillator, and
+  what a firmware credits for that jitter must not be taken from the model.
+  Bit 31 of the emulator-only register 0xfff8 stops the 32 kHz count where it
+  is (an oscillator that no longer ticks; 0x74b bit 5 stops with it); clearing
+  it lets the count go on from the time-based value.
+  TC32EMU_K32_FROZEN=1: 0x750 and 0x74b bit 5 read as at power-on, a 32 kHz
+  count that stands still for the code that reads it (the timer wake keeps
+  its own count).
+- The public key engine (16, Table 16-2; registers at 0x2000, operand RAM A
+  at 0x2400 and B at 0x3000, a slot every 0x24 bytes for 256-bit operands).
+  CTRL.Go runs the microcode MC_PTR names, on operand slots the datasheet
+  does not give:
+  point multiplication (0x10: p in B3, R^2 mod p in A3, -p^-1 mod 2^32 in
+  B4, the point in B0 and B1, a in A5, the scalar in A4; the result in A0 and
+  A1), the check that a point is on the curve (0x0c: b in A4; STOP_LOG 3 if
+  not) and the Montgomery constants (0x28: from B3 into A3 and B4). Done
+  comes TC32EMU_PKE_US later (register 0xffec; the chip's time is not known)
+  and a write to STAT clears it; CTRL.Stop ends an operation with STOP_LOG 1.
+  The reset (0x61 bit 7) and clock (0x64 bit 7) must be released and on.
+  Another radix, another operand form (EXE_CONF), another microcode or wrong
+  Montgomery constants stop the emulation: what the chip does then is not
+  modelled.
 - The ADC's DMA (DFIFO2, from the B87 SDK's register.h and dfifo.h): while
-  0xb10 bit 2 is set, its buffer holds 32-bit samples of adc_code. The ADC
-  itself is not modelled.
-  Nothing ties these two to the hardware: a firmware may only need a
-  number and a sample to arrive, and no check depends on the values.
+  0xb10 bit 2 is set, its buffer holds 32-bit samples. On a pin input (the
+  positive input in analog 0xeb bits 7:4 not 0xf) every sample is adc_code
+  at once. Nothing ties that to the hardware: a firmware may only need a
+  number and a sample to arrive, and no check depends on the value.
+  On the VBAT input (0xf) the ADC converts: one conversion per (r_max_mc +
+  r_max_s) cycles of the state clock, ADC_STATE_HZ (analog 0xef, 0xf1; 250
+  when both are 0), from the moment the DMA is enabled, none while it is
+  powered down
+  (analog 0xfc bit 5), each written to the next 32-bit slot of the buffer,
+  which the DMA goes round from its start (only the last round lands after
+  a jump of the time). The codes are ADC_VBAT_CODE with the noise or the
+  fault TC32EMU_ADC names (ADC_MODES below); the noise is the caller's
+  assumption and says nothing about the chip's.
+  The emulator-only register 0xffe4 (u32) gives a pin input a code of its
+  own (ADC_PIN_CODE below), so a test tells the inputs apart.
+- The SPI master (DS-TLSR8278 7.4, Table 7-7) and one device on its bus
+  (SPI_DEVICE below), once a device is attached (before that 0x08-0x0b are
+  plain storage, as for images that bring their own model of what is on the
+  bus): a write of 0x08 in master mode (0x09 bit 1) with the
+  SPI function on (0x0a bit 7), the module's clock on (0x63 bit 0) and out
+  of reset (0x60 bit 0 clear) clocks the octet out, 0x09 bit 6 reading 1
+  for 8 * 2 * (0x0a bits 6:0 + 1) system clock cycles; with 0x09 bit 3
+  (read) a read of 0x08 gives the octet clocked in and clocks the next.
+  The reset values of Table 7-7 (0x09 = 0x11, 0x0a = 0x05) are not
+  modelled: the registers read 0 after a reset. An octet reaches the
+  device only through CK and DO pins the pin registers route to the SPI
+  (PA4 or PD7, PA2 or PB7: their Table 7-1 function, the GPIO function off,
+  for PA4 and PD7 the SPI/I2C output select 0x5b6), and the device's answer
+  reaches 0x08 only through a routed DI (PA3 or PB6, with the SPI input
+  select 0x5b7 and the input enable); 0 otherwise. A write of 0x08 while an
+  octet is going out is an error.
 - GPIO interrupt (7.1.3): a rising edge of |((input ^ polarity) & irq)
   latches source 18 while 0x5b5 bit 3 is set; board models call
   gpio_irq_update() when they change a pin.
@@ -112,13 +178,22 @@ Other registers are plain storage.
 
 SPDX-License-Identifier: Apache-2.0
 """
+import importlib.util
 import math
 import os
 import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
+import p256  # noqa: E402
 from tc32isa import TOP, to_thumb  # noqa: E402,F401
+
+# emulator/aes128.py for the AES block, loaded by its path: putting this
+# directory on sys.path would let its trace.py shadow the standard library's.
+_aes_spec = importlib.util.spec_from_file_location(
+    "tc32emu_aes128", os.path.join(os.path.dirname(os.path.abspath(__file__)), "aes128.py"))
+aes128 = importlib.util.module_from_spec(_aes_spec)
+_aes_spec.loader.exec_module(aes128)
 
 # Flash: 1 MB on the TLSR8278. TC32EMU_FLASH_SIZE gives a part with less
 # (0x80000: 512 KB).
@@ -229,6 +304,106 @@ ICACHE_MISS = int(os.environ.get("TC32EMU_ICACHE_MISS", "0"), 0)
 # the change then (run() serves it), as the chip's edge comes from the input
 # the firmware reads.
 PAD_C_PF = int(os.environ.get("TC32EMU_PAD_C_PF", "0"), 0)
+# The random number generator's source (TC32EMU_RBG = name[:parameter]), and
+# the emulator-only register 0xfff4 (u32: mode in bits 7:0, parameter in bits
+# 31:8) that sets it from the firmware; each setting starts its sequence
+# afresh. The words come from splitmix64 seeded with the parameter.
+#   lcg (0)      the default: SR bit 0 always 1, the fixed sequence above.
+#   healthy (1)  splitmix64 words.
+#   stuck (2)    one word, 0x5a5a5a5a ^ parameter, every time.
+#   biased (3)   each bit 1 with probability parameter / 256 (0: 243 / 256).
+#   cycle (4)    the first parameter splitmix64 words (0: 8), over and over.
+#   attacker (5) splitmix64 words from the parameter: a sequence someone
+#                outside knows (or chose); it passes statistical tests.
+#   never (6)    SR bit 0 never reads 1.
+# 0xfff8 (u32) sets TC32EMU_K32_JITTER_NS (bits 30:0) and stops the 32 kHz
+# count (bit 31), and 0xfffc (u32) restarts the jitter's generator with that
+# seed. None of these registers exists on the chip.
+RBG_MODES = ("lcg", "healthy", "stuck", "biased", "cycle", "attacker", "never")
+_rbg = os.environ.get("TC32EMU_RBG", "lcg").split(":")
+if _rbg[0] not in RBG_MODES:
+    raise ValueError("TC32EMU_RBG: " + _rbg[0])
+RBG_MODE, RBG_PARAM = RBG_MODES.index(_rbg[0]), (int(_rbg[1], 0) & 0xFFFFFF if len(_rbg) > 1 else 0)
+# The ADC on the VBAT input (TC32EMU_ADC = name[:parameter]), and the
+# emulator-only register 0xffe8 (u32: mode in bits 7:0, parameter in bits
+# 31:8) that sets it from the firmware; each setting starts its sequence
+# afresh, splitmix64 seeded with the parameter. A conversion gives
+# ADC_VBAT_CODE (3.3 V through the 1/3 divider against the 1175 mV
+# reference, as the B87 SDK's VBAT channel sets it up) and:
+#   noise (0)    the default: noise of (parameter & 0xff) / 10 LSB rms (0:
+#                2.0 LSB), a sum of four uniform 16-bit values, rounded.
+#   off (1)      no noise: the code alone.
+#   stuck (2)    one code, the parameter's low 13 bits (0: 0x1555).
+#   biased (3)   the noise of 2.0 LSB on parameter / 256 of the conversions
+#                (0: 16 / 256), the code alone on the others.
+#   ramp (4)     no noise; the code goes up by 1 every parameter
+#                conversions (0: 1), from 0x1fff back to 1.
+#   two (5)      the code or the code + parameter (0: 1), at random.
+#   attacker (6) the code + -32..31 from splitmix64 words from the parameter:
+#                a sequence someone outside knows (or chose); it passes
+#                statistical tests.
+#   never (7)    no conversion arrives.
+#   level (8)    the noise of 2.0 LSB around the parameter's low 13 bits (0:
+#                the code): a supply of another voltage, or a code that is
+#                not VBAT's.
+ADC_MODES = ("noise", "off", "stuck", "biased", "ramp", "two", "attacker", "never", "level")
+_adc = os.environ.get("TC32EMU_ADC", "noise").split(":")
+if _adc[0] not in ADC_MODES:
+    raise ValueError("TC32EMU_ADC: " + _adc[0])
+ADC_MODE, ADC_PARAM = ADC_MODES.index(_adc[0]), (int(_adc[1], 0) & 0xFFFFFF if len(_adc) > 1 else 0)
+ADC_VBAT_CODE = 0x1DF5            # 3300 / 3 / 1175 * 8192
+# ADC_PIN_CODE: the emulator-only register 0xffe4 (u32). Bits 23:16 a pin
+# input of analog 0xeb bits 7:4 (1-10: PB0-PB7, PC4, PC5), bits 15:0 the code
+# its samples carry from then on; bit 24 clear (0) puts every pin input back
+# to adc_code. Not a register of the chip.
+#
+# SPI_DEVICE: the emulator-only registers 0xffd8 and 0xffdc. A u32 write of
+# 0xffd8 attaches a device to the SPI bus afresh (its received octets and
+# counts cleared): bits 23:16 its chip select pin, 8 * port + pin (0xff: the
+# master's own chip select on PD2, 0x09 bit 0, active low), bit 24 the chip
+# select active high, bits 7:0 its answer: 0 echo (each octet answered with
+# the one before it in the transaction, 0xff first), 1 the constant in bits
+# 15:8, 2 a count up from bits 15:8. A u32 read of 0xffd8 gives the
+# transactions (bits 31:16, a chip select going active) and the octets
+# received while selected (bits 15:0); a u8 read of 0xffdc takes the next of
+# those octets (up to 4096 kept; 0 when none is left). Not registers of the
+# chip.
+SPI_FIFO_MAX = 4096
+
+# The clock the ADC's states count (TC32EMU_ADC_STATE_HZ): 12 MHz. DS-TLSR8278
+# 12.3 gives 24 MHz, but on a TLSR8278 with r_max_mc 240 + r_max_s 10 the codes of
+# VBAT showed a keyboard backlight's 500 us column slots 24 codes apart: a conversion
+# every 20.8 us (48 kHz), not 10.4 us. 24000000 gives the datasheet's rate.
+ADC_STATE_HZ = int(os.environ.get("TC32EMU_ADC_STATE_HZ", "12000000"), 0)
+ADC_SD_X10 = 378372               # K32_SUM4_SD * 10, the sum's standard deviation in tenths
+# The public key engine (DS-TLSR8278 16): the time one of its operations
+# takes, in us (TC32EMU_PKE_US, or register 0xffec). The chip's figure is not
+# in the datasheet; the default is a guess, and a firmware must wait for Done
+# whatever the time.
+PKE_US = int(os.environ.get("TC32EMU_PKE_US", "30000"), 0)   # a point multiplication on the chip: 30 ms
+PKE_PVER_US = int(os.environ.get("TC32EMU_PKE_PVER_US", "200"), 0)  # a check that a point is on the curve
+# The engine's registers (Table 16-2) and operand RAM (Table 16-1, 256 bits:
+# a slot every 0x24 bytes) at their offsets in the register space.
+PKE_CTRL, PKE_CONF, PKE_MC_PTR, PKE_STAT, PKE_RT_CODE, PKE_EXE_CONF = 0x2000, 0x2004, 0x2010, 0x2020, 0x2024, 0x2050
+PKE_RAM_A, PKE_RAM_B, PKE_STEP, PKE_RAM_END = 0x2400, 0x3000, 0x24, 0x3200
+PKE_PMUL, PKE_PVER, PKE_CAL_PRE_MON = 0x10, 0x0C, 0x28
+PKE_RT_STOPPED, PKE_RT_NO_INVERSE, PKE_RT_NOT_ON_CURVE = 1, 2, 3
+K32_JITTER_NS = int(os.environ.get("TC32EMU_K32_JITTER_NS", "0"), 0)
+K32_JITTER_SEED = int(os.environ.get("TC32EMU_K32_JITTER_SEED", "1"), 0)
+K32_FROZEN = os.environ.get("TC32EMU_K32_FROZEN", "0") not in ("", "0")
+K32_PERIOD_MS = 1000 / 32768      # exact in binary
+K32_JITTER_SPAN = 4096            # periods given jitter at most after a jump of the time
+K32_SUM4_SD = 37837.2264          # standard deviation of a sum of four uniform 16-bit values
+M64 = (1 << 64) - 1
+
+
+def splitmix64(state):
+    """One step of splitmix64: (next state, 64-bit output)."""
+    state = (state + 0x9E3779B97F4A7C15) & M64
+    z = state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
+    return state, z ^ (z >> 31)
 PAD_R_PCT = int(os.environ.get("TC32EMU_PAD_R_PCT", "100"), 0)
 PAD_R_OHM = {1: 1_000_000, 2: 100_000, 3: 10_000}
 ICACHE_LINES, ICACHE_LINE_SHIFT = 64, 5
@@ -343,6 +518,22 @@ STIMER_CTRL_RESET = 0xC1   # 0x74a: 32 kHz calibration mode 0xc, write mode; tim
 STIMER_EN = 0x02           # 0x74a bit 1
 STIMER_IRQ = 0x04          # 0x748 bit 2
 M32 = 0xFFFFFFFF
+
+
+# Arithmetic on a short Weierstrass curve y^2 = x^3 + a x + b over the prime
+# field of p, in affine coordinates, for the public key engine's model: the
+# point at infinity is None. The engine's curve parameters come from its
+# operand RAM, so a wrong p or a gives a wrong answer, as on the chip.
+def ec_add(p, a, P, Q):
+    return p256.add(P, Q, p, a)
+
+
+def ec_mul(p, a, k, P):
+    return p256.mul(k, P, p, a)
+
+
+def ec_on_curve(p, a, b, P):
+    return p256.on_curve(P, p, a, b)
 
 
 class EmuError(Exception):
@@ -599,12 +790,22 @@ class Machine:
         # ADC samples the DFIFO2 DMA writes: the code for about 3.9 V with the
         # SDK's 1175 mV reference and 1/8 prescaler (3900 / (1175 * 8) * 8192)
         self.adc_code = 0x0D47
+        self.adc_pin_codes = {}   # pin input (1-10) -> its code (0xffe4)
+        self.spi_dev = None       # the SPI device (0xffd8): a dict, None when none is attached
         self.reset_count = 0
         self.icache_miss = ICACHE_MISS     # cycles per flash cache miss, 0: no cache model
         self.icache_tags = [-1] * ICACHE_LINES
         self.icache_misses = 0
         # Power-on: the SRAM's contents (SRAM_SEED, see sram_fill); a reset keeps them.
         self.sram = sram_fill(SRAM_SEED, SRAM_SIZE) if SRAM_SEED else bytearray(SRAM_SIZE)
+        # The random number generator's source and the 32 kHz jitter (RBG_MODES,
+        # K32_JITTER_NS): emulator settings, kept across resets.
+        self.rbg_set(RBG_MODE, RBG_PARAM)
+        self.adc_set(ADC_MODE, ADC_PARAM)
+        self.pke_us = PKE_US
+        self.k32_sigma_ns = K32_JITTER_NS
+        self.k32_rng = K32_JITTER_SEED & M64
+        self.k32_stopped = None  # the frozen 32 kHz count (0xfff8 bit 31), or None
         self.reset(boot_slot, cause_wd=False)
 
     # ------------------------------------------------------------ reset/boot
@@ -639,6 +840,11 @@ class Machine:
             keep_analog[0x3C] = 0x0F
         self.regs_mem = bytearray(REG_SIZE)
         self.analog = bytearray(256)
+        self.adc_on = False      # VBAT conversions under way (dfifo2_fill)
+        # The public key engine: the cycle its operation is done at (None:
+        # idle, Done clear), the stop reason it ends with, and the operand RAM
+        # words it writes then.
+        self.pke_done_at, self.pke_rt, self.pke_pending = None, 0, []
         # 0x35-0x39 are kept in deep sleep only: every reset puts them at their
         # defaults, 0x20, 0, 0, 0 and 0xff (the same Table 2-2).
         self.analog[0x35], self.analog[0x39] = 0x20, 0xFF
@@ -690,11 +896,17 @@ class Machine:
         self.tmr_wrap = [False, False]   # Timer0/1: the next match only after the count wraps (TIMER_CAPTURE_BELOW)
         self.wd_fed_cycles = 0
         self.mspi_auto = False
+        self.spi_busy_until = 0  # cycles: 0x09 bit 6 reads 1 until then
+        self.spi_rx = 0          # the octet last clocked in (0x08)
+        if self.spi_dev is not None:
+            self.spi_dev["selected"] = False
         self.halted = None
         self.boot_copy = copy
         self.asleep = None       # the system timer value when suspend began
         self.sleep_since = 0.0
         self.k32_wake = None     # 32 kHz timer wake value (0x74c, set by 0x74b bit 3)
+        self.k32_count, self.k32_next = 0, K32_PERIOD_MS  # with jitter: the count and its next edge (ms)
+        self.aes_in, self.aes_out = b"", b""
         self.reset_count += 1
         for f in getattr(self, "reset_hooks", ()):
             f()
@@ -793,7 +1005,193 @@ class Machine:
         return self.stimer_raw() & ~7
 
     def k32_now(self):
-        return int(self.ms() * 32.768) & M32
+        if self.k32_stopped is not None:
+            return self.k32_stopped
+        if not self.k32_sigma_ns:
+            return int(self.ms() * 32.768) & M32
+        t = self.ms()
+        if t >= self.k32_next:
+            # After a long jump of the time (an idle skip, a sleep) only the
+            # last K32_JITTER_SPAN periods get jitter; the rest are exact.
+            n = int((t - self.k32_next) / K32_PERIOD_MS)
+            if n > K32_JITTER_SPAN:
+                skip = n - K32_JITTER_SPAN
+                self.k32_count += skip
+                self.k32_next += skip * K32_PERIOD_MS
+            while t >= self.k32_next:
+                self.k32_count += 1
+                self.k32_next += K32_PERIOD_MS + self.k32_jitter_ms()
+        return self.k32_count & M32
+
+    def k32_jitter_ms(self):
+        """One period's jitter: a sum of four uniform 16-bit values, centred and
+        scaled to k32_sigma_ns."""
+        self.k32_rng, z = splitmix64(self.k32_rng)
+        s = (z & 0xFFFF) + ((z >> 16) & 0xFFFF) + ((z >> 32) & 0xFFFF) + (z >> 48) - 131070
+        return float(s) * self.k32_sigma_ns / K32_SUM4_SD * 1e-6
+
+    def k32_set_jitter(self, sigma_ns):
+        """Turn the 32 kHz jitter on (or change it) from the exact count now."""
+        if sigma_ns and not self.k32_sigma_ns:
+            self.k32_count = int(self.ms() * 32.768)
+            self.k32_next = (self.k32_count + 1) * K32_PERIOD_MS
+        self.k32_sigma_ns = sigma_ns
+
+    def rbg_set(self, mode, param):
+        """The random number generator's source (RBG_MODES), from its start."""
+        self.rbg_mode, self.rbg_param, self.rbg_state, self.rbg_index = mode, param, param, 0
+        self.rbg_cycle = []
+        if mode == 4:
+            s = 0
+            for _ in range(param or 8):
+                s, z = splitmix64(s)
+                self.rbg_cycle.append(z >> 32)
+
+    def rbg_ready(self):
+        m = self.regs_mem
+        if self.rbg_mode == 0:
+            return True
+        return (self.rbg_mode != 6 and not m[0x62] & 0x08 and m[0x65] & 0x08 and m[0x4400] & 0x01) != 0
+
+    def rbg_word(self):
+        mode = self.rbg_mode
+        if mode == 0:
+            self.rng = (getattr(self, "rng", 0x12345678) * 1103515245 + 12345) & M32
+            return self.rng
+        if not self.rbg_ready():
+            return 0
+        if mode == 2:
+            return 0x5A5A5A5A ^ self.rbg_param
+        if mode == 3:
+            p, w = self.rbg_param or 243, 0
+            for i in range(4):
+                self.rbg_state, z = splitmix64(self.rbg_state)
+                for j in range(8):
+                    if ((z >> (8 * j)) & 0xFF) < p:
+                        w |= 1 << (8 * i + j)
+            return w
+        if mode == 4:
+            w = self.rbg_cycle[self.rbg_index % len(self.rbg_cycle)]
+            self.rbg_index += 1
+            return w
+        self.rbg_state, z = splitmix64(self.rbg_state)
+        return z >> 32
+
+    # -------------------------------------------------- public key engine
+    def pke_operand(self, off, words=8):
+        return int.from_bytes(self.regs_mem[off:off + 4 * words], "little")
+
+    def pke_done(self):
+        """Whether the engine's Done bit reads 1; the results reach the operand RAM then."""
+        if self.pke_done_at is None or self.cycles < self.pke_done_at:
+            return False
+        for off, value, words in self.pke_pending:
+            self.regs_mem[off:off + 4 * words] = value.to_bytes(4 * words, "little")
+        self.pke_pending = []
+        return True
+
+    def pke_stop(self):
+        if self.pke_done_at is not None and not self.pke_done():
+            self.pke_rt, self.pke_pending, self.pke_done_at = PKE_RT_STOPPED, [], self.cycles
+            self.event("PKE: stopped")
+
+    def pke_go(self):
+        """CTRL.Go: the microcode MC_PTR names, on the operand RAM: p in B3, R^2 mod p in A3,
+        -p^-1 mod 2^32 in B4, the point in B0 and B1, a in A5; the scalar in A4 for PMUL, b in A4 for
+        PVER; PMUL's result in A0 and A1; CAL_PRE_MON fills A3 and B4 from B3 (the slots are not in
+        DS-TLSR8278), done PKE_US later (PKE_PVER_US for PVER; a multiplication by 0 is never
+        done, as on the chip). What the chip does outside that is not known: another radix,
+        another operand form (EXE_CONF), another microcode, or a start with the block in reset or
+        without its clock stops the emulation."""
+        m = self.regs_mem
+        here = self.symbolize(self.r[15])
+        if m[0x61] & 0x80:
+            raise EmuError(f"PKE started while in reset (0x61 bit 7) at {here}")
+        if not m[0x64] & 0x80:
+            raise EmuError(f"PKE started without its clock (0x64 bit 7) at {here}")
+        if self.pke_done_at is not None and not self.pke_done():
+            raise EmuError(f"PKE started while running at {here}")
+        conf = int.from_bytes(m[PKE_CONF:PKE_CONF + 4], "little")
+        if (conf >> 24) & 7 != 2 or (conf >> 16) & 0xFF != 8:
+            raise EmuError(f"PKE radix 0x{conf:08x} not modelled (256-bit operands: base 2, partial 8) at {here}")
+        exe = int.from_bytes(m[PKE_EXE_CONF:PKE_EXE_CONF + 4], "little")
+        if exe & 0x3F != 0x15:
+            raise EmuError(f"PKE operand form 0x{exe:02x} not modelled (affine, not Montgomery: 0x15) at {here}")
+        mc = int.from_bytes(m[PKE_MC_PTR:PKE_MC_PTR + 4], "little") & 0xFF
+        a_slot = lambda i: PKE_RAM_A + i * PKE_STEP
+        b_slot = lambda i: PKE_RAM_B + i * PKE_STEP
+        p = self.pke_operand(b_slot(3))
+        rt, out = 0, []
+        if mc == PKE_CAL_PRE_MON:
+            if p < 3 or p % 2 == 0:
+                raise EmuError(f"PKE CAL_PRE_MON of 0x{p:x} at {here}")
+            out = [(a_slot(3), pow(1 << 256, 2, p), 9), (b_slot(4), -pow(p, -1, 1 << 32) % (1 << 32), 9)]
+            text = "Montgomery constants"
+        elif mc in (PKE_PMUL, PKE_PVER):
+            if p < 3 or p % 2 == 0:
+                raise EmuError(f"PKE modulus 0x{p:x} at {here}")
+            if self.pke_operand(a_slot(3)) != pow(1 << 256, 2, p):
+                raise EmuError(f"PKE A3 is not R^2 mod p at {here}")
+            if self.pke_operand(b_slot(4), 1) != -pow(p, -1, 1 << 32) % (1 << 32):
+                raise EmuError(f"PKE B4 is not -p^-1 mod 2^32 at {here}")
+            P = (self.pke_operand(b_slot(0)), self.pke_operand(b_slot(1)))
+            a = self.pke_operand(a_slot(5))
+            if mc == PKE_PVER:
+                b = self.pke_operand(a_slot(4))
+                rt = 0 if ec_on_curve(p, a, b, P) else PKE_RT_NOT_ON_CURVE
+                text = "point " + ("on" if rt == 0 else "not on") + " the curve"
+            else:
+                k = self.pke_operand(a_slot(4))
+                if k == 0:
+                    # The chip never finishes a multiplication by 0: Done stays clear until Stop.
+                    self.pke_rt, self.pke_pending, self.pke_done_at = 0, [], float("inf")
+                    self.event("PKE: point multiplication by 0, never done")
+                    return
+                Q = ec_mul(p, a, k, P) if P[0] < p and P[1] < p else None
+                if Q is None:
+                    rt = PKE_RT_NO_INVERSE
+                    text = "point multiplication: no valid modulo inverse"
+                else:
+                    out = [(a_slot(0), Q[0], 9), (a_slot(1), Q[1], 9)]
+                    text = "point multiplication"
+        else:
+            raise EmuError(f"PKE microcode 0x{mc:02x} not modelled at {here}")
+        us = PKE_PVER_US if mc == PKE_PVER else self.pke_us
+        self.pke_rt, self.pke_pending = rt, out
+        self.pke_done_at = self.cycles + -(-us * self.cpu_hz // 1_000_000)
+        self.event(f"PKE: {text}, done in {us} us")
+
+    def adc_set(self, mode, param):
+        """The ADC's VBAT conversions (ADC_MODES), from the start of their sequence."""
+        self.adc_mode, self.adc_param, self.adc_state, self.adc_index = mode, param, param, 0
+
+    def adc_noise(self, sigma_x10):
+        """Noise of sigma_x10 / 10 LSB rms: a sum of four uniform 16-bit values, rounded."""
+        self.adc_state, z = splitmix64(self.adc_state)
+        s = (z & 0xFFFF) + ((z >> 16) & 0xFFFF) + ((z >> 32) & 0xFFFF) + (z >> 48) - 131070
+        return (2 * s * sigma_x10 + ADC_SD_X10) // (2 * ADC_SD_X10)
+
+    def adc_next(self):
+        """The next VBAT conversion's code (13 bits; ADC_MODES)."""
+        mode, p, code = self.adc_mode, self.adc_param, ADC_VBAT_CODE
+        k = self.adc_index
+        self.adc_index += 1
+        if mode == 1:
+            return code
+        if mode == 2:
+            return (p & 0x1FFF) or 0x1555
+        if mode == 4:
+            return (code + k // (p or 1) - 1) % 0x1FFF + 1
+        if mode == 0:
+            return min(max(code + self.adc_noise((p & 0xFF) or 20), 0), 0x1FFF)
+        if mode == 8:
+            return min(max(((p & 0x1FFF) or code) + self.adc_noise(20), 0), 0x1FFF)
+        self.adc_state, z = splitmix64(self.adc_state)
+        if mode == 3:
+            return code + self.adc_noise(20) if (z >> 56) < (p or 16) else code
+        if mode == 5:
+            return (code + (p or 1) * (z >> 63)) & 0x1FFF
+        return code + (z & 63) - 32
 
     def tick2_now(self):
         return ((self.cycles - self.tick2_base) & M32)
@@ -801,6 +1199,8 @@ class Machine:
     def update_time(self):
         if self.regs_mem[0xB10] & 0x04:
             self.dfifo2_fill()
+        else:
+            self.adc_on = False
         now = self.stimer_now()
         if self.stimer_on and self.regs_mem[0x748] & STIMER_IRQ:
             # Compare reached between the last check and now (wrapping arithmetic).
@@ -897,16 +1297,102 @@ class Machine:
                 self.tmr_wrap[n] = False
 
     def dfifo2_fill(self):
-        """The ADC's DMA (DFIFO2, the misc channel): while enabled (0xb10 bit
-        2) it keeps its buffer (0xb08 address, 0xb0b high byte, 0xb0a size in
-        16-byte units - 1) full of 32-bit samples. Samples arrive at once here."""
-        m = self.regs_mem
+        """The ADC's DMA (DFIFO2, the misc channel) while enabled (0xb10 bit
+        2): its buffer is 0xb08 (address), 0xb0b (high byte) and 0xb0a (size
+        in 16-byte units - 1). A pin input keeps it full of adc_code at once;
+        the VBAT input (analog 0xeb bits 7:4 = 0xf) puts each conversion
+        into the next 32-bit slot as its time comes (adc_next)."""
+        m, a = self.regs_mem, self.analog
         hi = m[0xB0B] or 0x04
         addr = 0x800000 | (hi << 16) | m[0xB08] | (m[0xB09] << 8)
         size = (m[0xB0A] + 1) * 16
         o = addr - SRAM_BASE
-        if 0 <= o and o + size <= SRAM_SIZE:
-            self.sram[o:o + size] = self.adc_code.to_bytes(4, "little") * (size // 4)
+        if not (0 <= o and o + size <= SRAM_SIZE):
+            return
+        if a[0xEB] >> 4 != 0xF:
+            self.adc_on = False
+            code = self.adc_pin_codes.get(a[0xEB] >> 4, self.adc_code)
+            self.sram[o:o + size] = code.to_bytes(4, "little") * (size // 4)
+            return
+        if not self.adc_on:
+            states = (a[0xEF] | (a[0xF1] >> 6) << 8) + (a[0xF1] & 0x0F)
+            self.adc_on, self.adc_t0, self.adc_done = True, self.cycles, 0
+            self.adc_period = max(1, (states or 250) * self.cpu_hz // ADC_STATE_HZ)
+        due = (self.cycles - self.adc_t0) // self.adc_period
+        if self.adc_mode == 7 or a[0xFC] & 0x20:
+            self.adc_done = due
+            return
+        slots = size // 4
+        if due - self.adc_done > slots:
+            self.adc_done = due - slots
+        while self.adc_done < due:
+            i = o + 4 * (self.adc_done % slots)
+            self.sram[i:i + 4] = self.adc_next().to_bytes(4, "little")
+            self.adc_done += 1
+
+    # ------------------------------------------------------------ SPI master
+    def spi_running(self):
+        """A device attached (0xffd8), master mode, the SPI function, the
+        module clock on, out of reset."""
+        r = self.regs_mem
+        return bool(self.spi_dev is not None and r[0x09] & 0x02 and r[0x0A] & 0x80 and r[0x63] & 0x01
+                    and not r[0x60] & 0x01)
+
+    def spi_pin(self, port, pin, func):
+        """The pad has function func (Table 7-1) and its GPIO function off."""
+        r = self.regs_mem
+        mux = (r[0x5A8 + 2 * port + (pin >> 2)] >> (2 * (pin & 3))) & 3
+        return mux == func and not (r[0x586 + 8 * port] >> pin) & 1
+
+    def spi_routes(self):
+        """(ck, do, di): a CK, a DO and a DI pad routed to the SPI."""
+        r = self.regs_mem
+        ck = (self.spi_pin(0, 4, 0) and r[0x5B6] & 0x20) or (self.spi_pin(3, 7, 0) and r[0x5B6] & 0x80)
+        do = self.spi_pin(0, 2, 0) or self.spi_pin(1, 7, 1)
+        di = ((self.spi_pin(0, 3, 0) and r[0x5B7] & 0x01 and r[0x581] & 0x08)
+              or (self.spi_pin(1, 6, 1) and r[0x5B7] & 0x04 and r[0x589] & 0x40))
+        return bool(ck), bool(do), bool(di)
+
+    def spi_selected(self):
+        """The device's chip select is active: a GPIO pad at its active level,
+        or the master's own chip select (PD2 as SPI_CN, 0x09 bit 0 low)."""
+        d = self.spi_dev
+        if d["cs"] == 0xFF:
+            return self.spi_pin(3, 2, 0) and not self.regs_mem[0x09] & 0x01
+        port, bit = d["cs"] >> 3, d["cs"] & 7
+        lvl, flt = self.pad_levels(port)
+        return not (flt >> bit) & 1 and bool((lvl >> bit) & 1) == d["high"]
+
+    def spi_cs_update(self):
+        """A chip select going active starts a transaction."""
+        d = self.spi_dev
+        if d is None:
+            return
+        sel = self.spi_selected()
+        if sel and not d["selected"]:
+            d["transactions"] += 1
+            d["prev"] = 0xFF
+        d["selected"] = sel
+
+    def spi_octet(self, out):
+        """One octet: out to the device (None: DO not driven), its answer
+        into 0x08; busy for 8 SPI clocks of 2 * (divider + 1) cycles each."""
+        ck, do, di = self.spi_routes()
+        self.spi_busy_until = self.cycles + 16 * ((self.regs_mem[0x0A] & 0x7F) + 1)
+        ans = 0
+        d = self.spi_dev
+        if d is not None and ck:
+            self.spi_cs_update()
+            if d["selected"]:
+                mode, k = d["mode"], d["k"]
+                ans = d["prev"] if mode == 0 else k if mode == 1 else (k + d["answered"]) & 0xFF
+                d["answered"] += 1
+                if do and out is not None:
+                    d["count"] += 1
+                    if len(d["fifo"]) < SPI_FIFO_MAX:
+                        d["fifo"].append(out)
+                    d["prev"] = out
+        self.spi_rx = ans if ck and di else 0
 
     def cycles_to_stimer(self, target):
         if not self.stimer_on:
@@ -915,6 +1401,26 @@ class Machine:
         if delta >= 0x80000000:
             return 0
         return delta * self.cpu_hz // STIMER_HZ + 1
+
+    def cycles_to_timer_match(self):
+        """The cycles until the first match of a running Timer0/1 whose
+        interrupt is unmasked (0x640 bit 0/1), or None when there is none.
+        A timer waiting for its wrap matches after the wrap."""
+        best = None
+        for n in (0, 1):
+            if self.tmr_base[n] is None or not self.regs_mem[0x640] & (1 << n):
+                continue
+            cap = int.from_bytes(self.regs_mem[0x624 + 4 * n:0x628 + 4 * n], "little")
+            if not cap:
+                continue
+            left = self.tmr_base[n] + cap - self.cycles
+            if self.tmr_wrap[n]:
+                left += 1 << 32
+            if left < 0:
+                left = 0
+            if best is None or left < best:
+                best = left
+        return best
 
     # ------------------------------------------------------------ memory
     def xip(self, a):
@@ -1007,6 +1513,19 @@ class Machine:
             self.update_time()
             val = (self.irq_sources() & 0xFFFFFF).to_bytes(4, "little")
             return int.from_bytes(val[o - 0x648:o - 0x648 + size], "little")
+        if o == 0x08 and size == 1 and self.spi_dev is not None:
+            v = self.spi_rx
+            if self.spi_running() and m[0x09] & 0x08:
+                self.spi_octet(None)       # a read clocks the next octet in
+            return v
+        if o == 0x09 and size == 1 and self.spi_dev is not None:
+            return (m[0x09] & ~0x40) | (0x40 if self.cycles < self.spi_busy_until else 0)
+        if o == 0xFFD8 and size == 4:
+            d = self.spi_dev
+            return 0 if d is None else ((d["transactions"] & 0xFFFF) << 16) | (d["count"] & 0xFFFF)
+        if o == 0xFFDC and size == 1:
+            d = self.spi_dev
+            return d["fifo"].pop(0) if d is not None and d["fifo"] else 0
         if o == 0x0C and size == 1:
             if self.flash.beyond is not None:
                 if self.flash.beyond_mode == "stop":
@@ -1023,14 +1542,24 @@ class Machine:
         if o == 0xBA and size == 1:
             return m[0xBA] & ~0x01  # analog port never busy
         if o == 0x4408 and size == 1:
-            return m[0x4408] | 0x01   # random number ready
+            return (m[0x4408] | 0x01) if self.rbg_ready() else (m[0x4408] & 0xFE)   # a number is ready
         if o == 0x440C and size == 4:
-            self.rng = (getattr(self, "rng", 0x12345678) * 1103515245 + 12345) & M32
-            return self.rng
+            return self.rbg_word()
+        if o == PKE_STAT and size in (1, 4):
+            return 0x01 if self.pke_done() else 0x00    # the public key engine: Done
+        if o == PKE_RT_CODE and size in (1, 4):
+            return self.pke_rt if self.pke_done() else 0
+        if PKE_RAM_A <= o < PKE_RAM_END:
+            self.pke_done()   # a finished operation's results are in the operand RAM
+        if o == 0x548 and size == 4:
+            # The AES block's output, a word per read.
+            v = int.from_bytes(self.aes_out[:4].ljust(4, b"\0"), "little")
+            self.aes_out = self.aes_out[4:]
+            return v
         if o == 0x74B and size == 1:
-            return (self.k32_now() & 1) << 5
+            return 0 if K32_FROZEN else (self.k32_now() & 1) << 5
         if o == 0x750 and size == 4:
-            return self.k32_now()
+            return 0 if K32_FROZEN else self.k32_now()
         if o == 0x754 and size == 4:
             # reg_system_32k_tick_cal: system timer ticks per 32 kHz tick, times
             # 16 (the B87 SDK's cpu_sleep_wakeup scales by it >> 4); measured by
@@ -1049,6 +1578,98 @@ class Machine:
         m = self.regs_mem
         if self.reg_log is not None:
             self.reg_log.add((o, size, "w", self.r[15]))
+        if o == 0xFFE4 and size == 4:
+            # Emulator-only setting (ADC_PIN_CODE): a pin input's code.
+            val &= M32
+            if not val >> 24:
+                self.adc_pin_codes = {}
+            elif 1 <= (val >> 16) & 0xFF <= 10:
+                self.adc_pin_codes[(val >> 16) & 0xFF] = val & 0xFFFF
+            else:
+                raise EmuError(f"0xffe4: no ADC pin input {(val >> 16) & 0xFF}")
+            m[o:o + 4] = val.to_bytes(4, "little")
+            return
+        if o == 0xFFD8 and size == 4:
+            # Emulator-only setting (SPI_DEVICE): a device on the SPI bus, afresh.
+            val &= M32
+            if val & 0xFF > 2:
+                raise EmuError(f"0xffd8: no SPI device answer {val & 0xFF}")
+            self.spi_dev = {"mode": val & 0xFF, "k": (val >> 8) & 0xFF, "cs": (val >> 16) & 0xFF,
+                            "high": bool(val >> 24 & 1), "fifo": [], "count": 0, "transactions": 0,
+                            "answered": 0, "prev": 0xFF, "selected": False}
+            self.spi_dev["selected"] = self.spi_selected()
+            self.event(f"SPI device: answer {val & 0xFF}, chip select 0x{(val >> 16) & 0xFF:02x}"
+                       f"{' active high' if val >> 24 & 1 else ''}")
+            return
+        if o == 0x08 and size == 1:
+            if self.spi_running():
+                if self.cycles < self.spi_busy_until:
+                    raise EmuError(f"SPI: 0x08 written while an octet is going out at {self.symbolize(self.r[15])}")
+                m[0x08] = val & 0xFF
+                self.spi_octet(None if m[0x09] & 0x04 else val & 0xFF)
+                return
+        if o == 0x09 and size == 1 and self.spi_dev is not None:
+            m[0x09] = val & ~0x40 & 0xFF
+            self.spi_cs_update()
+        if o == PKE_CTRL and size in (1, 4):
+            # The public key engine's control: bit 0 Go, bit 16 Stop.
+            if val & 0x01:
+                self.pke_go()
+            if size == 4 and val & 0x10000:
+                self.pke_stop()
+            return
+        if o == PKE_STAT and size in (1, 4):
+            # A write clears Done once the operation has ended, whatever bit 0
+            # holds (DS-TLSR8278 Table 16-2 names a write of 1).
+            if self.pke_done():
+                self.pke_done_at = None
+            return
+        if o == 0xFFEC and size == 4:
+            # Emulator-only setting: the public key engine's time per operation, in us.
+            self.pke_us = val & M32
+            self.event(f"PKE: {self.pke_us} us per operation")
+            m[o:o + 4] = self.pke_us.to_bytes(4, "little")
+            return
+        if o == 0xFFE8 and size == 4:
+            # Emulator-only setting (ADC_MODES): the ADC's VBAT conversions.
+            val &= M32
+            if (val & 0xFF) >= len(ADC_MODES):
+                raise EmuError(f"0xffe8: no ADC mode {val & 0xFF}")
+            self.adc_set(val & 0xFF, val >> 8)
+            self.event(f"ADC on VBAT: {ADC_MODES[val & 0xFF]}, parameter {val >> 8}")
+            m[o:o + 4] = val.to_bytes(4, "little")
+            return
+        if o in (0xFFF4, 0xFFF8, 0xFFFC) and size == 4:
+            # Emulator-only settings (RBG_MODES): the random number source, the
+            # 32 kHz jitter and its seed.
+            val &= M32
+            if o == 0xFFF4:
+                if (val & 0xFF) >= len(RBG_MODES):
+                    raise EmuError(f"0xfff4: no random number source {val & 0xFF}")
+                self.rbg_set(val & 0xFF, val >> 8)
+                self.event(f"random number source: {RBG_MODES[val & 0xFF]}, parameter {val >> 8}")
+            elif o == 0xFFF8:
+                self.k32_set_jitter(val & 0x7FFFFFFF)
+                self.k32_stopped = None
+                if val >> 31:
+                    self.k32_stopped = self.k32_now()
+                self.event(f"32 kHz jitter: {val & 0x7FFFFFFF} ns{', count stopped' if val >> 31 else ''}")
+            else:
+                self.k32_rng = val
+            m[o:o + 4] = val.to_bytes(4, "little")
+            return
+        if (o == 0x540 and size == 1) or (o == 0x548 and size == 4):
+            # The AES block: 0x540 starts a block, 0x548 takes the input.
+            if o == 0x540:
+                m[0x540] = (val & 0x01) | 0x02
+                self.aes_in, self.aes_out = b"", b""
+                return
+            self.aes_in += (val & M32).to_bytes(4, "little")
+            if len(self.aes_in) == 16:
+                f = aes128.decrypt if m[0x540] & 1 else aes128.encrypt
+                self.aes_out, self.aes_in = f(bytes(m[0x550:0x560]), self.aes_in), b""
+                m[0x540] = (m[0x540] & 0x01) | 0x04
+            return
         if o == 0x740 and size == 4:
             self.tick_base, self.tick_base_cycles = val, self.cycles
             self.last_tick = val & ~7
@@ -1187,6 +1808,7 @@ class Machine:
                         self.analog[0xCF] = (self.analog[0xCF] | done) if m[0xB9] & 1 else (self.analog[0xCF] & ~done)
                     if 0x0E <= addr <= 0x15:
                         self.hold_pads((addr - 0x0E) // 2)     # a pull changed
+                        self.spi_cs_update()
                     self.analog_writes.append((addr, m[0xB9], self.symbolize(self.r[15])))
                     self.analog_log.append(("w", addr, m[0xB9]))
                     if addr == 0x0B and (old ^ m[0xB9]) & 0x80:
@@ -1206,6 +1828,8 @@ class Machine:
                 self.hold_pads(port)
         if o < 0x5A0 and o + size > 0x580 or o <= 0x5B5 < o + size:
             self.gpio_irq_update()
+        if self.spi_dev is not None and o < 0x5B8 and o + size > 0x580:
+            self.spi_cs_update()
 
     def hold_pads(self, port):
         """Take the levels of a port's driven or pulled pads into pad_hold: a
@@ -1762,11 +2386,18 @@ class Machine:
                 self.take_irq()
             elif (idle_ranges and self.regs_mem[0x643] & 1 and not self.i_bit
                   and any(lo <= self.r[15] < hi for lo, hi in idle_ranges)):
-                # Idle loop: jump to the next compare or watchdog deadline. Only
-                # while an interrupt could be taken: one that became pending while
-                # they are off is taken when the code turns them on, not at the
-                # next compare (checks/idle_skip_check.py).
+                # Idle loop: jump to the next system timer compare, or to the
+                # next match of a running Timer0/1 whose interrupt is unmasked,
+                # whichever comes first (the match sets the timer's status, an
+                # interrupt level, and the interrupt follows as the match would
+                # have interrupted the loop). Only while an interrupt could be
+                # taken: one that became pending while they are off is taken
+                # when the code turns them on, not at the next compare
+                # (checks/idle_skip_check.py).
                 skip = self.cycles_to_stimer(self.stimer_cmp) if self.regs_mem[0x748] & STIMER_IRQ else 0
+                match = self.cycles_to_timer_match()
+                if skip > 0 and match is not None and match < skip:
+                    skip = match
                 skip = min(skip, max_cycles - self.cycles)   # the caller's time limit stands
                 if self.pad_rc_since:
                     skip = min(skip, max(self.pad_rc_due(), 0) + 32)   # a pad reaching its level is an event

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check the TC32 image thumb2tc32.py wrote against the Thumb ELF it came from.
+"""Check a TC32 image against the ELF it came from: the image thumb2tc32.py
+wrote from a Thumb ELF, or the one elf2bin.py wrote from a TC32 ELF.
 
 forms_check.py and the emulator's runs read the ELF or execute the image;
 neither compares every byte of the written image with the link. This does,
@@ -13,7 +14,10 @@ Each halfword of a loaded section is classified from the ELF:
 - data: everything else ($d, literal pools, data objects, other sections).
 Code must be thumb2tc32.encode() of the ELF's halfword (the permutation that
 isa_check.py verified against Telink's objdump, and the two rewrites); data
-must be the ELF's halfword unchanged. Padding between sections inside a
+must be the ELF's halfword unchanged. An ELF whose build attributes name the
+core tc32 (llvm-readelf -A: Tag_CPU_name, written by clang -mcpu=tc32, the
+direct path) holds TC32 code already: there code must be the ELF's halfword
+unchanged too, so every byte of the image is the link's. Padding between sections inside a
 segment must be the ELF's bytes; between segments, 0xff (thumb2tc32's fill,
 erased flash). The image must be as long as objcopy's output.
 
@@ -112,6 +116,17 @@ def symbols(tool, elf):
     return out
 
 
+def cpu_name(tool, elf):
+    """Tag_CPU_name as llvm-readelf -A prints it ("" when absent)."""
+    lines = readelf(tool, "-A", elf).splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "TagName: CPU_name":
+            for nxt in lines[i + 1:i + 3]:
+                if nxt.strip().startswith("Value:"):
+                    return nxt.split(":", 1)[1].strip()
+    return ""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("elf")
@@ -131,6 +146,7 @@ def main():
     secs = sections(a.readelf, a.elf)
     segs = loads(a.readelf, a.elf)
     syms = symbols(a.readelf, a.elf)
+    tc32 = cpu_name(a.readelf, a.elf).lower() == "tc32"
 
     bad = []
     if len(img) != len(raw):
@@ -175,9 +191,9 @@ def main():
             code = "X" in flags and kind == "t" and not any(lo <= addr < hi for lo, hi in objs)
             hw, = struct.unpack_from("<H", src, i)
             got, = struct.unpack_from("<H", img, o + i) if o + i + 2 <= len(img) else (None,)
-            want = thumb2tc32.encode(hw) if code else hw
+            want = thumb2tc32.encode(hw) if code and not tc32 else hw
             counts["code" if code else "data"] += 1
-            if code and thumb2tc32.rewrite(hw)[1] in ("movs", "udf"):
+            if code and not tc32 and thumb2tc32.rewrite(hw)[1] in ("movs", "udf"):
                 counts["rewritten"] += 1
             if got != want:
                 if len(bad) < 40:
@@ -302,8 +318,9 @@ def main():
         if len(bad) == n0:
             startup = (f"; startup checked ({len(code)} B of instructions, {len(man['pool'])} pool words, "
                        f"entry 0x{man['entry']:x}" + (" with the watchdog" if out and out > man["entry"] else "") + ")")
+    how = "TC32 as linked" if tc32 else f"re-encoded, {counts['rewritten']} rewritten"
     print(f"{a.bin}: {len(img)} B; {len(loaded)} loaded sections; {counts['code']} code halfwords "
-          f"(re-encoded, {counts['rewritten']} rewritten), {counts['data']} data halfwords (unchanged); "
+          f"({how}), {counts['data']} data halfwords (unchanged); "
           f"{len(bad)} mismatch(es); {data_copy}{blob}{startup}")
     for b in bad[:40]:
         print("  " + b)

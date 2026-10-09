@@ -7,7 +7,11 @@
 #
 # Environment: TC32_LLVM, TC32_LLD (where toolchain.py looks for clang and
 # ld.lld), OUT (default <repo>/build/sem),
-# DIVIDER=1 to build the helpers for the TLSR8278 hardware divider.
+# DIVIDER=1 to build the helpers for the TLSR8278 hardware divider,
+# DIRECT=1 for the direct path: the same with -mcpu=tc32 (llvm-tc32), which
+# writes TC32 code itself, -noarm on the C compiles (the core tc32 has the
+# feature; without it the returns would differ from the Thumb build's), and
+# elf2bin.py in place of thumb2tc32.py. The file names stay thumb_*.
 # SPDX-License-Identifier: Apache-2.0
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -19,17 +23,19 @@ OUT=${OUT:-$ROOT/build/sem}
 RT=$ROOT/compiler/runtime
 mkdir -p "$OUT"
 # The code generation flags a firmware built this way must use (see README).
-F="--target=thumbv4t-none-eabi -mcpu=arm7tdmi -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin -fno-jump-tables -mllvm -arm-load-store-opt=false"
+CPU=arm7tdmi WRITE=thumb2tc32.py C=""
+[ "${DIRECT:-0}" = 1 ] && CPU=tc32 WRITE=elf2bin.py C="-Xclang -target-feature -Xclang -noarm"
+F="--target=thumbv4t-none-eabi -mcpu=$CPU -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin -fno-jump-tables -mllvm -arm-load-store-opt=false"
 DIV=""
 [ "${DIVIDER:-0}" = 1 ] && DIV="-DTC32_TLSR8278_DIVIDER=1"
 $CLANG $F -c "$HERE/start_thumb.S" -o "$OUT/start.o"
 $CLANG $F -c "$RT/aeabi_thumb.S" -o "$OUT/aeabi_thumb.o"
-$CLANG $F -Oz $DIV -c "$RT/compiler_builtins.c" -o "$OUT/builtins.o"
-$CLANG $F -O1 -c "$HERE/mem.c" -o "$OUT/mem.o"
+$CLANG $F $C -Oz $DIV -c "$RT/compiler_builtins.c" -o "$OUT/builtins.o"
+$CLANG $F $C -O1 -c "$HERE/mem.c" -o "$OUT/mem.o"
 for O in O0 O2 Os Oz; do
-	$CLANG $F -$O -c "$HERE/sem.c" -o "$OUT/sem_$O.o"
+	$CLANG $F $C -$O -c "$HERE/sem.c" -o "$OUT/sem_$O.o"
 	$LLD -T "$HERE/thumb.ld" "$OUT/start.o" "$OUT/sem_$O.o" "$OUT/builtins.o" "$OUT/aeabi_thumb.o" "$OUT/mem.o" -o "$OUT/thumb_$O.elf"
-	python3 -B "$ROOT/compiler/thumb2tc32.py" "$OUT/thumb_$O.elf" "$OUT/thumb_$O.bin"
+	python3 -B "$ROOT/compiler/$WRITE" "$OUT/thumb_$O.elf" "$OUT/thumb_$O.bin"
 done
 cc -DSEM_HOST -O2 -o "$OUT/sem_host" "$HERE/sem.c"
 "$OUT/sem_host" > "$OUT/host.txt"

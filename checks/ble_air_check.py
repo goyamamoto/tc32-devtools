@@ -29,8 +29,15 @@ radio and the central, without any firmware image.
   LL_CONNECTION_UPDATE_IND queued behind it wait (empty PDUs, MD 0) through
   LL_START_ENC_RSP until the peripheral's LL_START_ENC_RSP, and the update's
   instant is counted from the event it is then first sent in; an
-  LL_REJECT_IND ends the wait too. The default sends the queue in its order
+  LL_REJECT_IND ends the wait too. An update first sent in a later packet
+  of the event just before its instant moves the instant's event all the
+  same: it starts anchor_in_window_ms after the old anchor and the next one
+  an interval of the update's later. The default sends the queue in its order
   with the instant as given.
+- param_update_lead: the LL_CONNECTION_UPDATE_IND that follows an accepted
+  L2CAP Connection Parameter Update Request has its instant that many events
+  after the event the request came in (0: 12); with ll_rules after the event
+  it is first sent in.
 - reclock: an air put on the radio during a connection leaves the next
   event at its time and makes the events after it the new clock's interval
   apart.
@@ -44,7 +51,7 @@ import random
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path[:0] = [ROOT, os.path.join(ROOT, "emulator")]
+sys.path[:0] = [os.path.join(ROOT, "common"), os.path.join(ROOT, "emulator")]
 import ble_air  # noqa: E402
 import ble_central  # noqa: E402
 import ble_radio  # noqa: E402
@@ -387,6 +394,42 @@ def rules():
               f"ll_rules {on}: sent in the order {got}; more to send after LL_ENC_REQ, after LL_START_ENC_REQ and"
               f" after the peripheral's LL_START_ENC_RSP: {more}")
 
+    # ll_rules: an update first sent after event 2 has timed event 3, with its instant 3.
+    c = connected(ll_rules=True)
+    r, m = c.radio, c.m
+
+    def step():
+        t, _, fn, _ = r.sched.pop(0)
+        m.cycles = int(t * m.cpu_hz / 1000) + 1
+        fn()
+        return t
+
+    for _ in range(3):
+        step()
+    c.connection_update(1, 0, 6, 0, 300, c.event + 1)
+    sent = name(c.take())
+    starts = [step() - c.anchor0 for _ in range(3)]
+    want = [90.0, 90.3, 97.8]
+    check(sent == "LL_CONNECTION_UPDATE_IND instant 3" and all(abs(a - b) < 1e-9 for a, b in zip(starts, want))
+          and c.update.get("applied") == round(c.anchor0 + 90.3, 3) and c.p["interval"] == 6
+          and c.stats["events"] == 5,
+          f"ll_rules: an update sent late in the event before its instant: {sent}; event 3 timed at"
+          f" {starts[0]:.3f} ms, run at {starts[1]:.3f} ms, event 4 at {starts[2]:.3f} ms;"
+          f" {c.stats['events']} events counted")
+
+    # param_update_lead: the request comes in event 40, the answer goes out then, the update in event 43.
+    req = bytes([0x12, 0x07, 8, 0, 6, 0, 6, 0, 44, 0, 0x2C, 0x01])
+    for lead, on, want in ((0, False, 52), (1, False, 41), (0, True, 55), (1, True, 44)):
+        c = connected(apply_update=True, ll_rules=on, param_update_lead=lead)
+        c.event = 40
+        c.l2cap(5, req)
+        answer = name(c.take())
+        c.event = 43
+        update = name(c.take())
+        check((answer, update) == ("L2CAP", f"LL_CONNECTION_UPDATE_IND instant {want}")
+              and c.update["instant"] == want,
+              f"param_update_lead {lead}, ll_rules {on}: {answer}, then {update}")
+
     # reclock: an air put on the radio during the connection.
     c = connected()
     r, m = c.radio, c.m
@@ -413,6 +456,19 @@ def rules():
     after = c.take()
     check((name(first), name(held), name(after)) == ("LL_ENC_REQ", "empty", "L2CAP"),
           f"ll_rules: an LL_REJECT_IND ends the wait: {name(first)}, {name(held)}, then {name(after)}")
+
+    # ll_rules: an update held behind the encryption start is not applied at the instant it was given.
+    for on in (True, False):
+        c = connected(ll_rules=on)
+        r, m = c.radio, c.m
+        c.queue_ll(bytes([0x03]) + bytes(22))                      # LL_ENC_REQ, never answered
+        c.connection_update(1, 0, 12, 0, 300, c.event + 3)
+        for _ in range(6):
+            t, _, fn, _ = r.sched.pop(0)
+            m.cycles = int(t * m.cpu_hz / 1000) + 1
+            fn()
+        applied = bool(c.update.get("applied"))
+        check(applied != on, f"ll_rules {on}: an update held behind LL_ENC_REQ past its instant: applied {applied}")
 
     # Another host's data: queue_data() with its tag, on_ack and rx_data.
     c = connected()

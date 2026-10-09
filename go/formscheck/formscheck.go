@@ -7,6 +7,10 @@
 //
 // Usage: forms-check check <elf> [--thumb] [--evidence vendor_forms.txt]
 //
+// An ELF whose build attributes name the core (Tag_CPU_name) must agree with
+// --thumb: tc32 (clang -mcpu=tc32, the direct path) without it, an ARM core
+// (the Thumb path) with it; otherwise it stops with exit status 2.
+//
 // SPDX-License-Identifier: Apache-2.0
 package formscheck
 
@@ -23,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goyamamoto/tc32-devtools/go/armattr"
 	"github.com/goyamamoto/tc32-devtools/go/tc32isa"
 	"github.com/goyamamoto/tc32-devtools/go/thumb2tc32"
 )
@@ -526,15 +531,24 @@ func Main(argv []string, w, ew io.Writer) int {
 			elfPath = argv[i]
 		}
 	}
-	if evidence == "" {
-		evidence = defaultEvidence()
-	}
-	ev, err := loadEvidence(evidence)
+	data, err := os.ReadFile(elfPath)
 	if err != nil {
 		fmt.Fprintln(ew, "forms-check:", err)
 		return 1
 	}
-	data, err := os.ReadFile(elfPath)
+	cpu, _, _ := armattr.CPUName(data)
+	if thumb && strings.EqualFold(cpu, "tc32") {
+		fmt.Fprintf(ew, "forms-check: %s names the core tc32: its code is TC32 already; check it without --thumb\n", elfPath)
+		return 2
+	}
+	if !thumb && cpu != "" && !strings.EqualFold(cpu, "tc32") {
+		fmt.Fprintf(ew, "forms-check: %s names the core %s: its code is Thumb; check it with --thumb\n", elfPath, cpu)
+		return 2
+	}
+	if evidence == "" {
+		evidence = defaultEvidence()
+	}
+	ev, err := loadEvidence(evidence)
 	if err != nil {
 		fmt.Fprintln(ew, "forms-check:", err)
 		return 1

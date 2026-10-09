@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 package ble
 
+import "math/big"
+
 // pyRandom reproduces Python's random.Random(seed) for a small int seed:
 // MT19937 seeded through init_by_array([seed]), getrandbits(k) as the top k
 // bits of one 32-bit output (k <= 32), and randrange(n) as
@@ -95,6 +97,21 @@ func (r *pyRandom) bytes(n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
 		out[i] = byte(r.randrange(256))
+	}
+	return out
+}
+
+// getrandbitsBig is Python's getrandbits(k) for any k: 32-bit words, the first generated the least
+// significant, the last one shifted right when k is not a multiple of 32.
+func (r *pyRandom) getrandbitsBig(k uint) *big.Int {
+	words := (k-1)/32 + 1
+	out := new(big.Int)
+	for i := uint(0); i < words; i++ {
+		w := r.genrand()
+		if k-32*i < 32 {
+			w >>= 32 - (k - 32*i)
+		}
+		out.Or(out, new(big.Int).Lsh(big.NewInt(int64(w)), 32*i))
 	}
 	return out
 }

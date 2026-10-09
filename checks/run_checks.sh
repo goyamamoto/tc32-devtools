@@ -88,6 +88,31 @@ if command -v go >/dev/null 2>&1; then
 	   && ! grep -q "hid_listener" "$ROOT/build/console/go_line.txt"; then
 		echo "console: both stop on the first line with --stop-line, before the second"
 	else echo "console: --stop-line DIFFERS or did not stop"; rc=1; fi
+	python3 -B "$ROOT/emulator/run_boot.py" --elf "$ROOT/build/console/hello.elf" --bin "$ROOT/build/console/hello.bin" --ms 1 --console --console-stream --stop-line "from tc32" > "$ROOT/build/console/py_stream.txt" 2>&1 || rc=1
+	"$ROOT/go/bin/run-boot" --elf "$ROOT/build/console/hello.elf" --bin "$ROOT/build/console/hello.bin" --ms 1 --console --console-stream --stop-line "from tc32" > "$ROOT/build/console/go_stream.txt" 2>&1 || rc=1
+	# The line comes out before the stop it causes and before the summary, once, and the summary does not repeat it.
+	sl=$(grep -n "^hello from tc32$" "$ROOT/build/console/go_stream.txt" | cut -d: -f1)
+	el=$(grep -n "\-\-stop-line: console line contains" "$ROOT/build/console/go_stream.txt" | cut -d: -f1)
+	if cmp -s "$ROOT/build/console/py_stream.txt" "$ROOT/build/console/go_stream.txt" && [ "$(grep -c "^hello from tc32$" "$ROOT/build/console/go_stream.txt")" = 1 ] \
+	   && [ -n "$sl" ] && [ -n "$el" ] && [ "$sl" -lt "$el" ] && grep -q "^console: 16 bytes, streamed above$" "$ROOT/build/console/go_stream.txt"; then
+		echo "console: --console-stream prints each line as it ends, before the events it causes; both engines the same"
+	else echo "console: --console-stream DIFFERS or out of order"; rc=1; fi
+	echo "== run_boot.py --stacks and run-boot --stacks paint the noinit stacks only (checks/console/stacks.c)"
+	python3 -B "$ROOT/emulator/run_boot.py" --elf "$ROOT/build/console/stacks.elf" --bin "$ROOT/build/console/stacks.bin" --ms 1 --console --stacks --stop-at _exit > "$ROOT/build/console/stacks_py.txt" 2>&1 || rc=1
+	"$ROOT/go/bin/run-boot" --elf "$ROOT/build/console/stacks.elf" --bin "$ROOT/build/console/stacks.bin" --ms 1 --console --stacks --stop-at _exit > "$ROOT/build/console/stacks_go.txt" 2>&1 || rc=1
+	# obj_type_stack (.data) keeps its word; thread_stack (noinit) is painted and measured.
+	if cmp -s "$ROOT/build/console/stacks_py.txt" "$ROOT/build/console/stacks_go.txt" && grep -q "^4b435453$" "$ROOT/build/console/stacks_go.txt" \
+	   && grep -q "^stacks: stack use within 75% of each stack: thread_stack 32 of 256 B$" "$ROOT/build/console/stacks_go.txt"; then
+		echo "stacks: both paint thread_stack only and measure 32 of 256 B; obj_type_stack keeps its contents"
+	else echo "stacks: DIFFERS, or a data object was painted"; rc=1; fi
+	echo "== run_boot.py --usb and run-boot --usb attach the USB controller model (checks/console/usb.c reads 0x800104)"
+	python3 -B "$ROOT/emulator/run_boot.py" --elf "$ROOT/build/console/usb.elf" --bin "$ROOT/build/console/usb.bin" --ms 1 --console --stop-at _exit --usb > "$ROOT/build/console/usb_py.txt" 2>&1 || rc=1
+	"$ROOT/go/bin/run-boot" --elf "$ROOT/build/console/usb.elf" --bin "$ROOT/build/console/usb.bin" --ms 1 --console --stop-at _exit --usb > "$ROOT/build/console/usb_go.txt" 2>&1 || rc=1
+	"$ROOT/go/bin/run-boot" --elf "$ROOT/build/console/usb.elf" --bin "$ROOT/build/console/usb.bin" --ms 1 --console --stop-at _exit > "$ROOT/build/console/usb_none.txt" 2>&1 || rc=1
+	if cmp -s "$ROOT/build/console/usb_py.txt" "$ROOT/build/console/usb_go.txt" && grep -q "^ff$" "$ROOT/build/console/usb_go.txt" \
+	   && grep -q "^00$" "$ROOT/build/console/usb_none.txt"; then
+		echo "usb: with --usb both read the model's 0xff at 0x800104 (0 without it); both engines the same"
+	else echo "usb: --usb DIFFERS between the engines, or the model is not attached"; rc=1; fi
 	echo "== a blob in an image: image_check --blob on the console image's test blob, both engines"
 	(cd "$ROOT/go" && go build -o bin/image-check ./cmd/image-check) || rc=1
 	C=$ROOT/build/console
@@ -142,6 +167,96 @@ PYEOF
 else
 	echo "== Go skipped: go not installed"
 fi
+echo "== the direct path (-mcpu=tc32): the clang of TC32_LLVM_DIRECT, else of TC32_LLVM, if it is llvm-tc32"
+DCC=${TC32_LLVM_DIRECT:-$(dirname "$(python3 -c "import sys; sys.path.insert(0, '$ROOT/common'); import toolchain; print(toolchain.tool('clang'))")")}
+if [ -x "$DCC/clang" ] && "$DCC/clang" --target=thumbv4t-none-eabi -mcpu=tc32 -mthumb -x c -c -o /dev/null /dev/null 2>/dev/null \
+   && [ -x "$DCC/ld.lld" ]; then
+	DLL="TC32_LLVM=$DCC TC32_LLD=$DCC"
+	for div in 0 1; do
+		# Both paths with the same compiler, so that only the encoders differ.
+		env $DLL DIVIDER=$div OUT="$ROOT/build/sem_pthumb_div$div" sh "$ROOT/checks/sem/build_thumb.sh" > /dev/null || rc=1
+		env $DLL DIVIDER=$div DIRECT=1 OUT="$ROOT/build/sem_direct_div$div" sh "$ROOT/checks/sem/build_thumb.sh" > /dev/null || rc=1
+		for O in O0 O2 Os Oz; do
+			T=$ROOT/build/sem_pthumb_div$div/thumb_$O D=$ROOT/build/sem_direct_div$div/thumb_$O
+			out=$(env $DLL python3 -B "$ROOT/compiler/path_diff.py" "$T.bin" "$D.bin" --elf "$D.elf" --elf2 "$T.elf") || rc=1
+			echo "div$div $O: $(echo "$out" | tail -1)"
+			out=$(env $DLL python3 -B "$ROOT/compiler/image_check.py" "$D.elf" "$D.bin") || rc=1
+			echo "$out" | tail -1 | sed 's/^.*thumb_/  image_check thumb_/'
+			# The forms report of the TC32 ELF equals that of the Thumb ELF with --thumb.
+			pf=0; python3 -B "$ROOT/compiler/forms_check.py" check "$D.elf" > "$ROOT/build/forms.direct.txt" || pf=$?
+			tf=0; python3 -B "$ROOT/compiler/forms_check.py" check "$T.elf" --thumb > "$ROOT/build/forms.pthumb.txt" || tf=$?
+			if cmp -s "$ROOT/build/forms.direct.txt" "$ROOT/build/forms.pthumb.txt" && [ $pf = $tf ]; then
+				echo "  forms_check: the TC32 ELF's report equals the Thumb ELF's (exit $pf)"
+			else echo "  forms_check: the TC32 ELF's report DIFFERS from the Thumb ELF's"; rc=1; fi
+		done
+		python3 -B "$ROOT/checks/sem_check.py" "$DCC/llvm-nm" "$ROOT/build/sem_direct_div$div/host.txt" \
+			"$ROOT"/build/sem_direct_div$div/thumb_O0.elf "$ROOT"/build/sem_direct_div$div/thumb_O2.elf \
+			"$ROOT"/build/sem_direct_div$div/thumb_Os.elf "$ROOT"/build/sem_direct_div$div/thumb_Oz.elf || rc=1
+	done
+	D=$ROOT/build/sem_direct_div1/thumb_Oz T=$ROOT/build/sem_pthumb_div1/thumb_Oz
+	# The refusals: each writer refuses the other path's ELF, forms_check a --thumb that disagrees with the core.
+	n=0
+	python3 -B "$ROOT/compiler/thumb2tc32.py" "$D.elf" "$ROOT/build/x.bin" 2> /dev/null && n=1
+	python3 -B "$ROOT/compiler/elf2bin.py" "$T.elf" "$ROOT/build/x.bin" 2> /dev/null && n=1
+	x=0; python3 -B "$ROOT/compiler/forms_check.py" check "$D.elf" --thumb > /dev/null 2>&1 || x=$?; [ $x = 2 ] || n=1
+	x=0; python3 -B "$ROOT/compiler/forms_check.py" check "$T.elf" > /dev/null 2>&1 || x=$?; [ $x = 2 ] || n=1
+	# A changed code byte in the direct image: image_check and path_diff must both see it.
+	python3 - "$D.bin" "$ROOT/build/direct_bad.bin" <<'PYEOF'
+import sys
+b = bytearray(open(sys.argv[1], "rb").read()); b[0x22] ^= 0x01; open(sys.argv[2], "wb").write(b)
+PYEOF
+	env $DLL python3 -B "$ROOT/compiler/image_check.py" "$D.elf" "$ROOT/build/direct_bad.bin" > /dev/null && n=1
+	env $DLL python3 -B "$ROOT/compiler/path_diff.py" "$T.bin" "$ROOT/build/direct_bad.bin" --elf "$D.elf" > /dev/null && n=1
+	if [ $n = 0 ]; then echo "refusals and negative controls: as expected"
+	else echo "refusals and negative controls: one was NOT refused or NOT seen"; rc=1; fi
+	if command -v go > /dev/null 2>&1; then
+		(cd "$ROOT/go" && go build -o bin/elf2bin ./cmd/elf2bin && go build -o bin/image-check ./cmd/image-check \
+			&& go build -o bin/forms-check ./cmd/forms-check && go build -o bin/thumb2tc32 ./cmd/thumb2tc32) || rc=1
+		gok=1
+		for elf in "$ROOT"/build/sem_direct_div0/thumb_*.elf "$ROOT"/build/sem_direct_div1/thumb_*.elf; do
+			"$ROOT/go/bin/elf2bin" "$elf" "${elf%.elf}.go.bin" > /dev/null || gok=0
+			cmp -s "${elf%.elf}.bin" "${elf%.elf}.go.bin" || gok=0
+			env $DLL python3 -B "$ROOT/compiler/image_check.py" "$elf" "${elf%.elf}.bin" > "$ROOT/build/ic.py.txt" 2>&1 || gok=0
+			env $DLL "$ROOT/go/bin/image-check" "$elf" "${elf%.elf}.bin" > "$ROOT/build/ic.go.txt" 2>&1 || gok=0
+			cmp -s "$ROOT/build/ic.py.txt" "$ROOT/build/ic.go.txt" || gok=0
+		done
+		prc=0; python3 -B "$ROOT/compiler/forms_check.py" check "$D.elf" > "$ROOT/build/forms.py.txt" || prc=$?
+		grc=0; "$ROOT/go/bin/forms-check" check "$D.elf" --evidence "$ROOT/compiler/vendor_forms.txt" > "$ROOT/build/forms.go.txt" || grc=$?
+		cmp -s "$ROOT/build/forms.py.txt" "$ROOT/build/forms.go.txt" && [ $prc = $grc ] || gok=0
+		"$ROOT/go/bin/thumb2tc32" "$D.elf" "$ROOT/build/x.bin" 2> /dev/null && gok=0
+		"$ROOT/go/bin/elf2bin" "$T.elf" "$ROOT/build/x.bin" 2> /dev/null && gok=0
+		x=0; "$ROOT/go/bin/forms-check" check "$D.elf" --thumb > /dev/null 2>&1 || x=$?; [ $x = 2 ] || gok=0
+		if [ $gok = 1 ]; then echo "Go elf2bin, image-check, forms-check and thumb2tc32: the same images, reports and refusals as Python"
+		else echo "Go elf2bin, image-check, forms-check or thumb2tc32 DIFFERS from Python on the direct path"; rc=1; fi
+	fi
+	echo "== asm_twin_check.py: checks/asm/twin.S translated and its twin twin.ual.S, both cores; a changed twin"
+	A=$ROOT/build/asm_twin
+	mkdir -p "$A"
+	python3 -B "$ROOT/compiler/tc32asm2thumb.py" "$ROOT/checks/asm/twin.S" "$A/twin.thumb.S" || rc=1
+	sed 's/movs r0, #0x93/movs r0, #0x13/' "$ROOT/checks/asm/twin.ual.S" > "$A/changed_insn.ual.S"
+	sed 's/\.word 0, 1, twin_entry/.word 0, 1, twin_irq_return/' "$ROOT/checks/asm/twin.ual.S" > "$A/changed_reloc.ual.S"
+	for cpu in arm7tdmi tc32; do
+		for f in twin.thumb.S changed_insn.ual.S changed_reloc.ual.S; do
+			"$DCC/clang" --target=thumbv4t-none-eabi -mcpu=$cpu -mthumb -c "$A/$f" -o "$A/${f%.S}.$cpu.o" || rc=1
+		done
+		"$DCC/clang" --target=thumbv4t-none-eabi -mcpu=$cpu -mthumb -c "$ROOT/checks/asm/twin.ual.S" -o "$A/twin.ual.$cpu.o" || rc=1
+		python3 -B "$ROOT/compiler/asm_twin_check.py" "$A/twin.thumb.$cpu.o" "$A/twin.ual.$cpu.o" | sed "s/^/$cpu: /" || rc=1
+		n=0
+		for f in changed_insn changed_reloc; do
+			python3 -B "$ROOT/compiler/asm_twin_check.py" "$A/twin.thumb.$cpu.o" "$A/$f.ual.$cpu.o" > "$A/$f.$cpu.txt" && n=1
+		done
+		if [ $n = 0 ] && grep -q "byte(s) differ" "$A/changed_insn.$cpu.txt" && grep -q "relocations of .data.twin" "$A/changed_reloc.$cpu.txt"; then
+			echo "$cpu: a changed instruction and a changed relocation in the twin are both reported"
+		else echo "$cpu: a change in the twin was NOT reported"; rc=1; fi
+	done
+	if command -v csmith > /dev/null 2>&1; then
+		echo "== ccdiff --compiler direct, Csmith seeds ${SEEDS:-1-20}: each image against the host and against the Thumb path's image"
+		python3 -B "$ROOT/checks/ccdiff/ccdiff.py" --compiler direct --cc "$DCC" --seeds "${SEEDS:-1-20}" --jobs "${JOBS:-4}" --hw-divider > "$ROOT/build/ccdiff.direct.txt" || rc=1
+		grep summary "$ROOT/build/ccdiff.direct.txt"
+	fi
+else
+	echo "skipped: no clang that takes -mcpu=tc32 (set TC32_LLVM_DIRECT to llvm-tc32's bin folder)"
+fi
 echo "== BLE models: known answers (AES, CCM, SMP, LL encryption, radio, channel selection)"
 out=$(python3 -B "$ROOT/checks/ble_models_check.py") || rc=1
 echo "$out" | tail -1
@@ -188,6 +303,18 @@ out=$(python3 -B "$ROOT/checks/sram_fill_check.py") || rc=1
 printf '%s\n' "$out" | tail -1
 echo "== timer_wake_check.py: the 32 kHz timer wake from suspend comes at its tick"
 out=$(python3 -B "$ROOT/checks/timer_wake_check.py") || rc=1
+printf '%s\n' "$out" | tail -1
+echo "== rbg_check.py: the random number generator's sources and the 32 kHz jitter (TC32EMU_RBG, TC32EMU_K32_JITTER_NS)"
+out=$(python3 -B "$ROOT/checks/rbg_check.py") || rc=1
+printf '%s\n' "$out" | tail -1
+echo "== adc_check.py: the ADC's conversions on VBAT and their faults (TC32EMU_ADC, register 0xffe8)"
+out=$(python3 -B "$ROOT/checks/adc_check.py") || rc=1
+printf '%s\n' "$out" | tail -1
+echo "== spi_check.py: the SPI master and its device (registers 0xffd8, 0xffdc), the ADC's pin codes (0xffe4)"
+out=$(python3 -B "$ROOT/checks/spi_check.py") || rc=1
+printf '%s\n' "$out" | tail -1
+echo "== pke_check.py: the public key engine's P-256 operations, Done and Stop (TC32EMU_PKE_US, register 0xffec)"
+out=$(python3 -B "$ROOT/checks/pke_check.py") || rc=1
 printf '%s\n' "$out" | tail -1
 echo "== symbolize_check.py: symbols given at construction and assigned afterwards"
 out=$(python3 -B "$ROOT/checks/symbolize_check.py") || rc=1

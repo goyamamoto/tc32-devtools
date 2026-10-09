@@ -14,7 +14,7 @@ Firmware built this way runs in daily use: the ZMK ports for three TLSR8278 keyb
 
 | Path | What it holds |
 |---|---|
-| `common/` | What the compiler tools, the emulator and the checks share: `tc32isa.py`, the TC32 ↔ Thumb opcode mapping (one table), and `toolchain.py`, where the LLVM tools are found (`TC32_LLVM`, `TC32_LLD`) |
+| `common/` | What the compiler tools, the emulator and the checks share: `tc32isa.py`, the TC32 ↔ Thumb opcode mapping (one table), `toolchain.py`, where the LLVM tools are found (`TC32_LLVM`, `TC32_LLD`), and `armattr.py`, the core an ELF's build attributes name |
 | `compiler/` | `thumb2tc32.py`, `tc32asm2thumb.py`, the checks of a written image (`image_check.py`, `forms_check.py`, `asm_check.py`), `tc32_flow.py`, and `runtime/` (the helpers clang calls) |
 | `emulator/` | `tc32emu.py` (CPU and TLSR8278 peripherals), `usb_model.py` (USB device controller and a host), `ble_radio.py`, `ble_central.py`, `ble_air.py`, `aes128.py` (radio, a scripted central, the air between them), `run_boot.py`, `stack_use.py`, `reg_audit.py`, `trace.py` |
 | `checks/` | `run_checks.sh` and the checks it runs; `isa_check.py`, `sem/`, `ccdiff/`, `telink/`, and the Zephyr and ZMK test drivers |
@@ -88,6 +88,17 @@ Telink's own toolchain is built the same way: a Thumb gcc 4.5 with an assembler 
 - `forms_check.py` compares every instruction form with the forms Telink's code uses (`compiler/vendor_forms.txt`: Telink's SDK libraries and libgcc, the executed code of an existing TC32 binary, and programs built by Telink's gcc). It fails on a form that has no vendor use. It reads the functions and the code outside them that a `$t` mapping symbol marks (hand-written assembly without `.type`/`.size`), so it reads every instruction `thumb2tc32.py` re-encodes: the counts are equal for the semantics test and for the ZMK images of three keyboards.
 - `tc32_flow.py` follows the control flow of a raw image without symbols, such as a vendor image, and reports the instruction forms it reaches.
 
+### The direct path: llvm-tc32 writes TC32
+
+[llvm-tc32](https://github.com/goyamamoto/llvm-tc32) can write TC32 machine code itself: `clang --target=thumbv4t-none-eabi -mcpu=tc32 -mthumb` generates the code of ARMv4T Thumb and writes it in TC32's encoding, and its ld.lld links such objects. The ELF names the core `tc32` in its build attributes (Tag_CPU_name).
+
+- `elf2bin.py` writes the image of such a link: the PT_LOAD segments at their physical addresses, 0xff between them, as `thumb2tc32.py` lays out its image, with nothing re-encoded. It refuses an ELF that does not name `tc32`; `thumb2tc32.py` refuses one that does.
+- `image_check.py` reads the core from the ELF (llvm-readelf -A). For a TC32 ELF every byte of the image must be the link's.
+- `forms_check.py check` takes a TC32 ELF without `--thumb`. A `--thumb` that disagrees with the core the ELF names stops it with exit status 2.
+- `path_diff.py` compares the two paths' images of the same sources, byte for byte. It reports each difference with its section, its kind (code, data, padding) and its symbol. The two encoders are independent, so equal images check each other.
+- `asm_twin_check.py` compares the objects of a Telink-syntax source, translated by `tc32asm2thumb.py`, and of its twin in standard syntax: sections, relocations by symbol, symbols and build attributes. A port can then keep both sources, and the direct path assembles the standard one as it is.
+- `checks/sem/build_thumb.sh` takes `DIRECT=1`, and `ccdiff.py --compiler direct` builds each Csmith program both ways with the same clang. The two images must be equal, and the direct one must print the host's checksum.
+
 ### tc32-cc: the compiler path as one command
 
 `go/cmd/tc32-cc` is one program for the whole path. It takes C and assembly like a C compiler, and on a link it writes the TC32 image and the ELF next to it:
@@ -159,7 +170,8 @@ Other undocumented cases are logged and recorded so a check can fail on them, ra
 **Running images.**
 
 - `run_boot.py` boots an image and reports the milestones it reaches. It runs the image alone or installed beside another image in the other slot, through watchdog and software resets, and it can make a symbol hang so the watchdog has something to catch.
-- `--console` collects what the firmware writes to register 0xfff0. That is a free offset, so a Zephyr log backend writing there makes the emulator its console. `--stop-at SYMBOL` and `--stop-line TEXT` end the run.
+- `--console` collects what the firmware writes to register 0xfff0. That is a free offset, so a Zephyr log backend writing there makes the emulator its console. `--stop-at SYMBOL` and `--stop-line TEXT` end the run. `--console-stream` prints each console line as the image ends it, among the run's events, for a test runner that reads the output as it comes (Zephyr's twister through the `run` target of zephyr-tc32's `cmake/emu/tc32emu.cmake`).
+- `--usb` attaches the USB device controller model (`usb_model.py`) with its host idle: no bus reset and no requests, the controller's registers as on the chip, for an image whose USB driver must find them so (zephyr-tc32's `run` target passes it when a TLSR8278 USB driver is in the image).
 - `stack_use.py` (`--stacks`) measures stack use from painted stacks.
 - `reg_audit.py` lists the registers an image touches whose names differ between the TLSR8258 and TLSR8278 SDKs.
 - Machine hooks let a board model sit around the emulator: register and memory hooks, pad levels, reset, time update, idle skip, trace, interrupt, wake, and flash write.
@@ -221,6 +233,7 @@ The Python tools are the canonical implementation, and `go/` is a port for speed
 |---|---|---|
 | `go/tc32isa` | `common/tc32isa.py` | The table is a permutation and equals the Python file's |
 | `go/cmd/thumb2tc32` | `compiler/thumb2tc32.py` | The same image, byte for byte, from every sem build |
+| `go/cmd/elf2bin`, `go/armattr` | `compiler/elf2bin.py`, `common/armattr.py` | The same image from every direct sem build, the same refusals |
 | `go/cmd/image-check` (incl. `--blob`, `--startup`) | `compiler/image_check.py` | Same rules. Both read the layout through llvm-objcopy and llvm-readelf, so neither trusts its own ELF reader |
 | `go/cmd/tc32asm2thumb` | `compiler/tc32asm2thumb.py` | Same output on `checks/asm/sample.S` (every form) and on a Zephyr port's assembly files |
 | `go/cmd/forms-check` | `compiler/forms_check.py check` | Same report and exit status. The `evidence` subcommand, which needs Telink's disassembly, stays in Python |

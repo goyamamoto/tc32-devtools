@@ -39,6 +39,10 @@ lists, the TC32-only instructions).
       Literal pools (targets of PC-relative loads), $d ranges and padding
       after a branch or return are skipped; untranslated Thumb traps and nops
       elsewhere are reported. The evidence subcommand counts functions only.
+      An ELF whose build attributes name the core (Tag_CPU_name) must agree
+      with --thumb: tc32 (clang -mcpu=tc32, the direct path) without it, an
+      ARM core (the Thumb path) with it; otherwise check stops with exit
+      status 2 before reading the code.
 
 SPDX-License-Identifier: Apache-2.0
 """
@@ -53,6 +57,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))
+import armattr  # noqa: E402
 import tc32isa as te  # noqa: E402
 import thumb2tc32  # noqa: E402
 
@@ -329,6 +334,15 @@ def image_forms(path, thumb=False, outside=False):
 
 
 def check(a):
+    cpu = armattr.cpu_name(open(a.elf, "rb").read()) or ""
+    if a.thumb and cpu.lower() == "tc32":
+        print(f"forms_check: {a.elf} names the core tc32: its code is TC32 already; check it without --thumb",
+              file=sys.stderr)
+        return 2
+    if not a.thumb and cpu and cpu.lower() != "tc32":
+        print(f"forms_check: {a.elf} names the core {cpu}: its code is Thumb; check it with --thumb",
+              file=sys.stderr)
+        return 2
     ev = load_evidence(a.evidence)
     seen, where, nfuncs, n_outside = image_forms(a.elf, a.thumb, outside=True)
     bad = [f for f in seen if sum(ev.get(f, (0, 0, 0))) == 0]

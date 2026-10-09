@@ -23,6 +23,16 @@ func Lines(elf string) ([]string, error) {
 	return strings.Split(string(out), "\n"), nil
 }
 
+// SysvLines runs llvm-nm -S --format=sysv on elf: one symbol a line, with
+// its section in the last of the '|'-separated fields.
+func SysvLines(elf string) ([]string, error) {
+	out, err := exec.Command(llvmtool.Tool("llvm-nm"), "-S", "--format=sysv", elf).Output()
+	if err != nil {
+		return nil, fmt.Errorf("llvm-nm: %v", err)
+	}
+	return strings.Split(string(out), "\n"), nil
+}
+
 // Symbols returns the code symbols' addresses (bit 0 cleared) and sizes.
 func Symbols(elf string) (map[string]uint32, map[string]uint32, error) {
 	lines, err := Lines(elf)

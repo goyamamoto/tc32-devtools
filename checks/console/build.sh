@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build hello.c as a TC32 image with the sem start code: $OUT/hello.elf and hello.bin.
+# Build hello.c as a TC32 image with the sem start code: $OUT/hello.elf and hello.bin;
+# stacks.c with stacks.ld: $OUT/stacks.elf and stacks.bin; usb.c: $OUT/usb.elf and usb.bin.
 # Environment: TC32_LLVM, TC32_LLD (see toolchain.py), OUT (default <repo>/build/console).
 # SPDX-License-Identifier: Apache-2.0
 set -eu
@@ -16,6 +17,12 @@ $CLANG $F -Oz -c "$HERE/hello.c" -o "$OUT/hello.o"
 $CLANG $F -c "$HERE/test_blob.S" -o "$OUT/test_blob.o"
 $LLD -T "$ROOT/checks/sem/thumb.ld" "$OUT/start.o" "$OUT/hello.o" "$OUT/test_blob.o" -o "$OUT/hello.elf"
 python3 -B "$ROOT/compiler/thumb2tc32.py" "$OUT/hello.elf" "$OUT/hello.bin" > /dev/null
+$CLANG $F -Oz -c "$HERE/stacks.c" -o "$OUT/stacks.o"
+$LLD -T "$HERE/stacks.ld" "$OUT/start.o" "$OUT/stacks.o" -o "$OUT/stacks.elf"
+python3 -B "$ROOT/compiler/thumb2tc32.py" "$OUT/stacks.elf" "$OUT/stacks.bin" > /dev/null
+$CLANG $F -Oz -c "$HERE/usb.c" -o "$OUT/usb.o"
+$LLD -T "$ROOT/checks/sem/thumb.ld" "$OUT/start.o" "$OUT/usb.o" -o "$OUT/usb.elf"
+python3 -B "$ROOT/compiler/thumb2tc32.py" "$OUT/usb.elf" "$OUT/usb.bin" > /dev/null
 # The test blob's manifest, and a wrong one.
 python3 - "$OUT" <<'PYEOF'
 import hashlib, json, sys

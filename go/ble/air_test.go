@@ -429,6 +429,47 @@ func TestAirRules(t *testing.T) {
 		}
 	}
 
+	// LLRules: an update first sent after event 2 has timed event 3, with its instant 3.
+	lc := airConnected(t, func(o *Options) { o.LLRules = true })
+	for i := 0; i < 3; i++ {
+		step(lc.Radio)
+	}
+	lc.ConnectionUpdate(1, 0, 6, 0, 300, lc.Event+1)
+	lsent := takeName(lc.take())
+	var lstarts []float64
+	for i := 0; i < 3; i++ {
+		lstarts = append(lstarts, step(lc.Radio)-lc.Anchor0)
+	}
+	lwant := []float64{90.0, 90.3, 97.8}
+	for i := range lwant {
+		if math.Abs(lstarts[i]-lwant[i]) > 1e-9 {
+			t.Fatalf("LLRules, an update sent late in the event before its instant: events at %v, want %v", lstarts, lwant)
+		}
+	}
+	if lsent != "LL_CONNECTION_UPDATE_IND instant 3" || lc.update.Applied != round3(lc.Anchor0+90.3) ||
+		lc.P.Interval != 6 || lc.Stats.Events != 5 {
+		t.Fatalf("LLRules, an update sent late in the event before its instant: %s, applied %v, interval %d, %d events",
+			lsent, lc.update.Applied, lc.P.Interval, lc.Stats.Events)
+	}
+
+	// UpdateLead: the request comes in event 40, the answer goes out then, the update in event 43.
+	req := []byte{0x12, 0x07, 8, 0, 6, 0, 6, 0, 44, 0, 0x2C, 0x01}
+	for _, k := range []struct {
+		lead int
+		on   bool
+		want int
+	}{{0, false, 52}, {1, false, 41}, {0, true, 55}, {1, true, 44}} {
+		c := airConnected(t, func(o *Options) { o.ApplyUpdate, o.LLRules, o.UpdateLead = true, k.on, k.lead })
+		c.Event = 40
+		c.l2cap(5, req)
+		answer := takeName(c.take())
+		c.Event = 43
+		update := takeName(c.take())
+		if answer != "L2CAP" || update != fmt.Sprintf("LL_CONNECTION_UPDATE_IND instant %d", k.want) || c.update.Instant != k.want {
+			t.Fatalf("UpdateLead %d, LLRules %v: %s, then %s", k.lead, k.on, answer, update)
+		}
+	}
+
 	// Reclock: an air put on the radio during the connection.
 	rc := airConnected(t, nil)
 	var starts []float64
@@ -457,6 +498,19 @@ func TestAirRules(t *testing.T) {
 	c.llCtrl([]byte{0x0D, 0x06}) // LL_REJECT_IND, key missing
 	if after := takeName(c.take()); first != "LL_ENC_REQ" || held != "empty" || after != "L2CAP" {
 		t.Fatalf("LLRules, LL_REJECT_IND: %s, %s, then %s", first, held, after)
+	}
+
+	// LLRules: an update held behind the encryption start is not applied at the instant it was given.
+	for _, on := range []bool{true, false} {
+		c := airConnected(t, func(o *Options) { o.LLRules = on })
+		c.QueueLL(append([]byte{0x03}, make([]byte, 22)...)) // LL_ENC_REQ, never answered
+		c.ConnectionUpdate(1, 0, 12, 0, 300, c.Event+3)
+		for i := 0; i < 6; i++ {
+			step(c.Radio)
+		}
+		if c.update.IsApplied == on {
+			t.Fatalf("LLRules %v: an update held behind LL_ENC_REQ past its instant: applied %v", on, c.update.IsApplied)
+		}
 	}
 
 	// Another host's data: QueueData with its tag, OnAck and RxData.
